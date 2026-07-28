@@ -28,12 +28,7 @@ import pytest
 
 # Per-minor symbol locations. Only entries that actually moved belong here.
 PINS = {
-    "0.23": {
-        # CommonAttentionMetadata lived under the backends helper module...
-        "attention_metadata_module": "vllm.v1.attention.backends.utils",
-    },
     "0.25": {
-        # ...and was promoted to the backend package root in 0.25.
         "attention_metadata_module": "vllm.v1.attention.backend",
     },
 }
@@ -67,7 +62,7 @@ def test_vllm_version_pin() -> None:
     minor = ".".join(version.split(".")[:2])
     assert minor in PINS, (
         f"gonka-poc targets vllm {', '.join(sorted(PINS))}, got {version!r}. "
-        f"The plugin pin (vllm>=0.23.0,!=0.24.*,<0.26) admits wheels this "
+        f"The plugin pin (vllm>=0.25.0,<0.26) admits wheels this "
         f"suite has not vetted."
     )
 
@@ -560,17 +555,15 @@ def test_launcher_serve_http() -> None:
 def test_sampling_params_has_fork_patches() -> None:
     """Pin the residual-fork SamplingParams fields the plugin depends on.
 
-    Background -- production engines ship a residual wheel of upstream vllm
-    carrying the sampler patches (on the 0.23 line:
-    ``vllm==0.23.0+gonka.sampler1`` from poc-sampler-residual-v0.23). Two
-    of those patches add per-request ``logprobs_mode`` and
-    ``enforced_token_ids`` fields to SamplingParams; the PoC v2 mixed-mode
-    sampling path (validator replay + logits-mode selection) reads them at
-    request admission. No 0.25-based residual wheel exists yet -- this
-    test pins what it must provide once built.
+    Background -- production engines ship a residual build of upstream vllm
+    carrying the sampler patches (poc-sampler-residual-v0.25). Two of those
+    patches add per-request ``logprobs_mode`` and ``enforced_token_ids``
+    fields to SamplingParams; the PoC v2 mixed-mode sampling path
+    (validator replay + logits-mode selection) reads them at request
+    admission.
 
     Why this test belongs in the PLUGIN contract suite (not just the fork):
-        The plugin advertises ``vllm>=0.23.0,!=0.24.*,<0.26`` as its
+        The plugin advertises ``vllm>=0.25.0,<0.26`` as its
         install pin. A vanilla ``pip install`` of a 0.25.x wheel (no
         ``+gonka.sampler``) satisfies that pin -- and the other contract
         tests stay GREEN against vanilla vllm 0.25, but engine startup
@@ -579,9 +572,9 @@ def test_sampling_params_has_fork_patches() -> None:
 
     Pattern: same as the residual branch's
     ``tests/contract/test_sampler_surface.py::test_sampling_params_has_poc_fields``.
-    SamplingParams is a ``msgspec.Struct`` on the 0.23 line, so we read
-    ``__struct_fields__`` first; the fallback chain to ``__annotations__``
-    and the ``__init__`` signature covers a dataclass conversion in 0.25.
+    We read ``__struct_fields__`` first (msgspec.Struct); the fallback
+    chain to ``__annotations__`` and the ``__init__`` signature covers a
+    dataclass conversion.
     """
     vllm = pytest.importorskip("vllm")
     # CI installs a vanilla upstream wheel for all the OTHER contract tests

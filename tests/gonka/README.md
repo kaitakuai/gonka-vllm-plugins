@@ -17,7 +17,7 @@ current set of files — each module docstring says what it covers.
 
 There are also vLLM private-surface drift detectors at
 `tests/contract/test_api_surface.py` — pins the upstream
-symbols the `gonka_poc._compat.v0_23` and `v0_25` shims depend on (class
+symbols the `gonka_poc._compat.v0_25` shim depends on (class
 names, dataclass fields, method signatures). Run on every vLLM pin bump.
 
 ### Live Tests (require running `gonka-vllm-serve`)
@@ -61,7 +61,7 @@ docker run -d --rm \
   -p 18199:18199 \
   --shm-size=4g \
   -e VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-  vllm/vllm-openai:v0.23.0-cu129 \
+  vllm/vllm-openai:v0.25.1 \
   sh -c "pip install 'git+https://github.com/kaitakuai/gonka-poc@main' && \
          gonka-vllm-serve \
            --model Qwen/Qwen2.5-0.5B-Instruct \
@@ -100,7 +100,7 @@ docker run -d \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -v /path/to/huggingface/cache:/root/.cache/huggingface \
-  vllm/vllm-openai:v0.23.0-cu129 \
+  vllm/vllm-openai:v0.25.1 \
   sh -c "pip install 'git+https://github.com/kaitakuai/gonka-poc@main' && \
          gonka-vllm-serve \
            --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \

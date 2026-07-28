@@ -1,7 +1,7 @@
 """gonka-poc: out-of-tree vLLM plugin for Gonka Proof-of-Compute (PoC v2).
 
 This package ships as a standalone pip-installable plugin that targets a stock
-vllm wheel (0.23.x / 0.25.x). It provides three integration surfaces:
+vllm wheel (0.25.x). It provides three integration surfaces:
 
 1. ``vllm.general_plugins`` entry point (:func:`gonka_poc.plugin.register`)
    that sets a process-local ``PLUGIN_LOADED`` flag, installs a one-shot

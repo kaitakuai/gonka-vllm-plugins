@@ -1,7 +1,7 @@
 # gonka-poc
 
 Out-of-tree vLLM plugin implementing **Gonka Proof-of-Compute v2** for stock
-`vllm` 0.23.x / 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
+`vllm` 0.25.x wheels. Ships as a Python package -- no fork, no source patches.
 
 > Not on PyPI yet — install from git (see Quick start). The plugin runs on top
 > of a residual wheel carrying the sampler patches; see ADR-0014 for why PoC
@@ -31,10 +31,10 @@ sampler-stack hook. See `MIGRATION_FROM_FORK.md`.
 
 Confirmed minimum versions for the supported deployment matrix:
 
-* **NVIDIA driver** >= 550 (vllm 0.23.0 base image targets cu129)
+* **NVIDIA driver** >= 550 (vllm 0.25.1 base image targets cu130)
 * **nvidia-container-toolkit** (Docker/Podman GPU passthrough)
 * **Python** 3.10 -- 3.12
-* **CUDA** 12.9 (matches `vllm/vllm-openai:v0.23.0-cu129`)
+* **CUDA** 13.0 (matches `vllm/vllm-openai:v0.25.1`)
 * **GPU memory** >= 80 GB total for the supported model classes
   (Qwen3-235B-FP8, MiniMax-M2.7-FP8). Per-GPU memory depends on
   TP/PP layout -- see the hardware matrix below.
@@ -81,7 +81,7 @@ is patched.
 docker run --rm -it --gpus all \
   -p 8000:8000 \
   -e VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-  vllm/vllm-openai:v0.23.0-cu129 \
+  vllm/vllm-openai:v0.25.1 \
   sh -c "pip install 'git+https://github.com/kaitakuai/gonka-poc@main' && \
          gonka-vllm-serve \
            --model <MODEL>  \
