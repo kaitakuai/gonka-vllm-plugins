@@ -28,7 +28,8 @@ PoC `init/generate` MUST execute three steps in this exact order:
 
 Inverting any pair breaks the contract:
 - spawn-before-abort → PoC forward fights in-flight chat batches for KV
-  cache and execution slots; cross-validator bit-compat drifts.
+  cache and execution slots; the derived artifacts drift away from what
+  other validators compute.
 - spawn-before-activate → new chat requests stream in alongside PoC; same
   failure mode plus a 503-window race.
 - activate-after-abort → the gap between `abort_all_requests` and

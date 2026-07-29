@@ -16,8 +16,8 @@ branch pin would silently start resolving to a different owner's HEAD.
 
 PoC validation no longer aborts live inference: it borrows KV blocks where the
 configuration is provably scratch-free, and falls back to the abort-based path
-everywhere else. The legacy bit-path is preserved byte-for-byte on every config,
-so consensus output is unchanged.
+everywhere else. The legacy derivation path is preserved unchanged on every config,
+so consensus output is unaffected.
 
 See [ADR-0015](adr/ADR-0015-poc-validation-kv-borrowing.md).
 

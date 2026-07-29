@@ -186,7 +186,7 @@ def _create_v1_attn_metadata(batch_size, seq_len, device, worker, positions,
         are provably disjoint from live inference; see
         :func:`_borrowed_layout`. Physical block ids enter ONLY the address
         translation (scatter targets / gather tables), never the attention
-        math, so artifacts are bit-identical across block choices.
+        math, so artifacts are invariant to block choice.
 
     ``positions`` is the shared per-token position tensor (also passed to the
     model forward); DeepSeek-V4's C128A metadata builder requires it, every
@@ -383,7 +383,7 @@ def execute_poc_forward(
         # CONSENSUS-CRITICAL fork in the embeds source (ADR-0015, Decision 5):
         #
         # * lease is None (mining + legacy validation): reproduce the DEPLOYED
-        #   bit-path exactly, INCLUDING the KV-scratch reuse. On configs where
+        #   derivation path exactly, INCLUDING the KV-scratch reuse. On configs where
         #   the scratch is selected (KV dtype == model dtype, contiguous —
         #   i.e. bf16-KV models), layer-0 K/V writes overlap the scratch view
         #   that also backs the residual, and the fleet's artifacts already
@@ -396,8 +396,10 @@ def execute_poc_forward(
         #   fresh path is bit-identical to what those configs already run.
         # NOTE: the deployed scratch path also fires with poc_stronger_rng=True
         # and then fills with the LEGACY per-nonce RNG (a known quirk that
-        # diverges from the fresh path's concat-murmur). Bit-compat with the
-        # fleet requires reproducing the quirk, not fixing it.
+        # diverges from the fresh path's concat-murmur). Agreement with the
+        # fleet requires reproducing the quirk, not fixing it: a node deriving
+        # inputs differently lands beyond the validation threshold on every
+        # nonce -- not noise the statistical test would absorb.
         kv_scratch = None
         if borrowed_block_ids is None:
             compat = _compat_current()

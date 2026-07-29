@@ -63,8 +63,9 @@ async def poc_validation_available(engine_client: Any) -> bool:
     Three gates, all required:
       * every worker rank reports ``scratch_capable=False`` — on
         scratch-capable (bf16-KV) configs the fleet's artifacts depend on
-        the legacy KV-scratch bit-path, and a leased forward would change
-        bits (ADR-0015, Decision 5);
+        the legacy KV-scratch derivation path, and a leased forward would
+        derive different vectors -- beyond the validation tolerance, not
+        within it (ADR-0015, Decision 5);
       * the borrow RPC surface answers (a zero-block borrow returns None
         without raising — proves the injected EngineCore methods and the
         utility transport);

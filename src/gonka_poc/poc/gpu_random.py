@@ -1,8 +1,16 @@
 """Deterministic seeded RNG primitives for the PoC forward.
 
 Reproducible random tensors seeded by (block_hash, public_key, nonce).
-CONSENSUS-CRITICAL: outputs must be bit-identical across prover and
-validator.
+
+CONSENSUS-CRITICAL, in this precise sense: prover and validator derive the
+model's input vectors INDEPENDENTLY, each running these functions on its own
+hardware. Validation then compares the resulting model outputs statistically
+(per-nonce L2 distance against a threshold, then a binomial test over the
+mismatch count) -- numeric noise within the tolerance is expected and passes.
+What must therefore stay fixed is the DERIVATION ALGORITHM: a node running a
+different derivation produces input vectors unrelated to the fleet's, its
+outputs land beyond the threshold on every nonce, and an honest node fails
+validation. Bitwise equality of outputs is neither required nor checked.
 """
 import hashlib
 import math
@@ -16,8 +24,9 @@ def _seed_from_string(seed_string: str) -> int:
     return int(h[:8], 16)
 
 
-# _murmur3_32/_batched_murmur3_32 are kept separate deliberately — consensus
-# bit-compat; do not unify without a cross-validator bit-compat harness.
+# _murmur3_32/_batched_murmur3_32 are kept separate deliberately: the fleet
+# derives inputs with these exact code paths. Do not unify without a
+# cross-validator harness proving the derivation is unchanged.
 def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
     """Murmur3 hash for int32 keys. Returns int64 to preserve full uint32 range."""
     c1, c2 = 0xCC9E2D51, 0x1B873593
@@ -71,8 +80,9 @@ def _batched_murmur3_32(keys: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor
     return h
 
 
-# _normal/_batched_normal are kept separate deliberately — consensus
-# bit-compat; do not unify without a cross-validator bit-compat harness.
+# _normal/_batched_normal are kept separate deliberately: the fleet derives
+# inputs with these exact code paths. Do not unify without a cross-validator
+# harness proving the derivation is unchanged.
 def _batched_normal(seeds: list, n: int, device: torch.device) -> torch.Tensor:
     """Generate batched normal random numbers for multiple seeds.
 

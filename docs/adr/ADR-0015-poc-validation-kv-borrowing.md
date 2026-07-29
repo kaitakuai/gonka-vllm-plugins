@@ -31,8 +31,9 @@ from the BlockPool so validation and inference coexist; mining
    `r = manager_bs/kernel_bs` (`_borrowed_layout`): slot of token *t* =
    `L[i][t//mbs]·mbs + t%mbs`; table entry *k* = `L[i][k//r]·r + k%r`.
    Physical ids enter ONLY address translation, never attention math —
-   artifacts stay bit-identical across block choices (prover and validator
-   always hold different blocks).
+   artifacts are invariant to block choice (prover and validator always
+   hold different blocks; agreement between them is statistical, not
+   bitwise — see `gpu_random.py`).
 4. **Reservation CM** (`poc_reservation`): per-process FIFO lock ×
    reserve → forwards → return (return retried ×3; a lost return is logged
    as a LEAK — pool shrinks until engine restart); escalation aborts
@@ -44,17 +45,18 @@ from the BlockPool so validation and inference coexist; mining
    the reset's return value is CHECKED — `False` escalates once through
    `reset_running_requests=True` and then logs an ERROR (a plain reset
    silently refuses while any block is held).
-5. **KV-scratch embeds reuse is KEPT on the lease-None path, bit-exact**
+5. **KV-scratch embeds reuse is KEPT on the lease-None path, unchanged**
    — including its `poc_stronger_rng` skew. On scratch-capable configs
-   (KV dtype == model dtype, contiguous — bf16-KV models) the fleet's
-   artifacts depend on the scratch's deterministic layer-0
-   K/V-over-residual overwrite; changing it would break consensus under
-   every deployed validator. The borrowed path always uses a fresh buffer
+   (KV dtype == model dtype, contiguous — bf16-KV models) the fleet
+   derives inputs through the scratch's deterministic layer-0
+   K/V-over-residual overwrite; a different derivation lands beyond the
+   validation threshold on every nonce (not noise the statistical test
+   absorbs), so an honest node would fail under every deployed validator. The borrowed path always uses a fresh buffer
    and is therefore **only enabled where the scratch can never fire**:
    the worker probe `execute_poc_borrow_compat` reports
    `scratch_capable`, and `poc_validation_available` disables borrowing
    on such configs (fp8/packed-KV models — GLM, DeepSeek-V4 — are
-   scratch-free and keep full bit-compat on both paths).
+   scratch-free and derive identically on both paths).
 6. **Feature detection:** `GET /api/v1/pow/versions` reports
    `poc_validation_inference` from an actual probe (worker
    scratch-capability + a zero-block borrow round-trip), never a literal.
@@ -66,7 +68,7 @@ from the BlockPool so validation and inference coexist; mining
 ## Consequences
 
 - Validation no longer stalls or corrupts inference on borrow-enabled
-  configs; mining priority and its bit-path are untouched on ALL configs
+  configs; mining priority and its derivation path are untouched on ALL configs
   (legacy layout + scratch unchanged byte-for-byte).
 - Known limits: the reservation lock is per API-server process
   (`--api-server-count > 1` → bound degrades to P×); a mining round that
@@ -74,5 +76,5 @@ from the BlockPool so validation and inference coexist; mining
   behaviour; disconnected wait=true clients are not cancelled); a return
   that fails 3× leaks the lease until engine restart (engine-side
   owner-tag/TTL is future work).
-- Hardware A/B (two different leases → bit-compare artifacts) belongs in
+- Hardware A/B (two different leases → numerically compare artifacts) belongs in
   the V4 experiment programme before production trust.
