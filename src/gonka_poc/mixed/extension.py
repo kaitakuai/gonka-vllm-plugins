@@ -42,6 +42,6 @@ class MixedPoCWorkerExtension(PoCWorkerExtension):
         """Drain finished engine-flow artifacts (k-id chains) accumulated on
         this worker. Msgpack-safe: ints/lists only."""
         from . import engine_flow
-        out = engine_flow.FLOW.collect()
+        out = engine_flow.FLOW.collect(self.model_runner)
         out["rank"] = getattr(self, "rank", -1)
         return out

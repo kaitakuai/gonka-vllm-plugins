@@ -815,5 +815,11 @@ async def pow_debug_rpc(request: Request):
         raise HTTPException(status_code=400,
                             detail=f"method not allowed: {method}")
     engine_client = await get_engine_client(request)
-    res = await engine_client.collective_rpc(method, kwargs=body.get("kwargs") or {})
+    try:
+        res = await asyncio.wait_for(
+            engine_client.collective_rpc(method, kwargs=body.get("kwargs") or {}),
+            timeout=POC_RPC_TIMEOUT_MS / 1000.0)
+    except (TimeoutError, asyncio.TimeoutError):
+        raise HTTPException(status_code=504,
+                            detail=f"collective_rpc timed out: {method}")
     return {"method": method, "results": res}

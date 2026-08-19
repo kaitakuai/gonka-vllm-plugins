@@ -50,14 +50,18 @@ def engine_flow_chain(nonce, max_tokens, hidden_of_step):
     """Та же цепочка через FLOW.post_forward c ручным планом шагов."""
     flow = ef.EngineFlow()
     rid = "req-1"
-    flow.reqs[rid] = ef._Req(nonce, BH, PK, seq_len=16,
-                             max_tokens=max_tokens, route_window=256)
+    req = ef._Req(nonce, BH, PK, seq_len=16,
+                  max_tokens=max_tokens, route_window=256)
+    req.dev_init(DEV)
+    flow.reqs[rid] = req
+    class _State:  # маска для очистки после финализации
+        mask = torch.zeros(4, 1, dtype=torch.bool)
     runner = types.SimpleNamespace(model=types.SimpleNamespace(
-        _poc_native_state=object()))
+        _poc_native_state=_State()))
     for step in range(0, max_tokens + 1):
         flow._plan = [(rid, 0, step)]
         flow.post_forward(runner, None, hidden_of_step(step))
-    art = flow.done[rid]
+    art = next(a for a in flow.done if a["req_id"] == rid)
     return art["k_points_steps"], art
 
 
@@ -101,9 +105,49 @@ def test_install_contract(monkeypatch):
 
 def test_collect_drains_and_marks_short_chains():
     flow = ef.EngineFlow()
-    flow.reqs["r"] = ef._Req(5, BH, PK, 16, 8, 256)
-    flow.reqs["r"].ks = [1, 2, 3]
+    r = ef._Req(5, BH, PK, 16, 8, 256)
+    r.ks = [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])]
+    flow.reqs["r"] = r
     flow._finalize("r")
     out = flow.collect()
     assert out["artifacts"][0]["aborted"] is True
     assert flow.collect()["artifacts"] == []
+
+
+def test_collect_reaps_orphans_via_runner():
+    """finished на пустом шаге: запроса нет в runner.requests — collect
+    обязан финализировать сироту как aborted (фикс красной команды №8)."""
+    flow = ef.EngineFlow()
+    flow.reqs["gone"] = ef._Req(1, BH, PK, 16, 8, 256)
+    runner = types.SimpleNamespace(requests={})
+    out = flow.collect(runner)
+    assert out["in_flight"] == 0
+    assert out["artifacts"][0]["aborted"] is True
+
+
+def test_register_rejects_bad_sampling_contract():
+    """max_tokens=N (а не N+1) или ignore_eos=False — нонс не регистрируется
+    (фикс №2): лучше отказ на входе, чем 100% aborted-артефактов."""
+    flow = ef.EngineFlow()
+    def mk(mt, ig):
+        xa = {f"{ef.XA_PREFIX}nonce": 1, f"{ef.XA_PREFIX}block_hash": BH,
+              f"{ef.XA_PREFIX}public_key": PK, f"{ef.XA_PREFIX}seq_len": 16,
+              f"{ef.XA_PREFIX}max_tokens": 8}
+        sp = types.SimpleNamespace(extra_args=xa, max_tokens=mt, ignore_eos=ig)
+        return types.SimpleNamespace(req_id=f"r{mt}{ig}", sampling_params=sp)
+    flow._register_new(types.SimpleNamespace(scheduled_new_reqs=[
+        mk(8, True),    # ровно N — мало
+        mk(9, False),   # без ignore_eos
+        mk(9, True),    # корректный
+    ]))
+    assert list(flow.reqs) == ["r9True"]
+
+
+def test_register_tolerates_malformed_xargs():
+    flow = ef.EngineFlow()
+    sp = types.SimpleNamespace(
+        extra_args={f"{ef.XA_PREFIX}nonce": "not-a-number"},
+        max_tokens=9, ignore_eos=True)
+    flow._register_new(types.SimpleNamespace(scheduled_new_reqs=[
+        types.SimpleNamespace(req_id="bad", sampling_params=sp)]))
+    assert flow.reqs == {}
