@@ -14,14 +14,24 @@ SRC = pathlib.Path(__file__).resolve().parents[2] / "src" / "gonka_poc"
 
 
 def test_core_never_imports_mixed():
+    """AST-разбор настоящих импортов — комментарии и строки не триггерят."""
+    import ast
     offenders = []
     for p in SRC.rglob("*.py"):
         if "mixed" in p.parts:
             continue
-        text = p.read_text(encoding="utf-8")
-        import re
-        if re.search(r"gonka_poc\.mixed|from\s+\.\s*mixed|from\s+gonka_poc\s+import[^\n]*\bmixed\b", text):
-            offenders.append(str(p.relative_to(SRC)))
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                names = [mod] + [f"{mod}.{a.name}" for a in node.names]
+            else:
+                continue
+            if any(n == "gonka_poc.mixed" or n.startswith("gonka_poc.mixed.")
+                   or n == "mixed" or n.endswith(".mixed") for n in names):
+                offenders.append(f"{p.relative_to(SRC)}: {names}")
     assert not offenders, f"core imports mixed (one-way rule): {offenders}"
 
 

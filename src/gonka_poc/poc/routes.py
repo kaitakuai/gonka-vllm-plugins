@@ -796,7 +796,7 @@ async def stop_round(request: Request) -> dict:
 
 
 # --- experimental control-plane RPC (branch poc-as-request only) -----------
-# String-dispatched, no imports from gonka_poc.mixed (one-way rule intact).
+# String-dispatched: core stays import-free of the mixed subpackage.
 # Gated by POC_DEBUG_RPC=1; allow-listed methods only; msgpack-safe returns.
 _DEBUG_RPC_ALLOWED = frozenset({
     "mixed_enable_pre_forward", "mixed_hook_stats",
