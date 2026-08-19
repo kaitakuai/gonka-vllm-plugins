@@ -61,16 +61,12 @@ def register() -> None:
 
     # PoC-wrapped model classes: registered FIRST so the engine compiles the
     # wrapped module (transforms inside the compiled graph — 0.20 bit path).
+    # ONE model-agnostic factory for every architecture (call agreement
+    # 2026-08-19): subclasses are built dynamically against whatever base
+    # classes this vLLM build ships; extra archs via POC_ARCHITECTURES env.
     try:
         from vllm import ModelRegistry
-        ModelRegistry.register_model(
-            "MiniMaxM2ForCausalLM",
-            "gonka_poc.models.minimax_m2_poc:MiniMaxM2ForCausalLMPoC")
-        logger.info("gonka_poc: MiniMaxM2ForCausalLM overridden with PoC-wrapped class")
-        # DeepSeek family (covers Kimi K-series — same declared architecture).
-        # Subclasses are built dynamically against whatever base classes this
-        # vLLM build ships, so register by class object, not qualname.
-        from gonka_poc.models.deepseek_poc import build_poc_subclasses
+        from gonka_poc.models.factory import build_poc_subclasses
         for arch, sub in build_poc_subclasses():
             ModelRegistry.register_model(arch, sub)
             logger.info("gonka_poc: %s overridden with PoC-wrapped class", arch)

@@ -194,7 +194,8 @@ def _find_decoder_layers(model: nn.Module) -> nn.Module:
 
 
 def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
-                      device, dtype, route_window: int) -> "PoCNativeState":
+                      device, dtype,
+                      route_window: Optional[int] = None) -> "PoCNativeState":
     """Bake PoC transforms by MONKEYPATCHING the bound ``forward`` of each
     decoder layer and each MoE gate — the modules, parameter names and the
     ``@support_torch_compile`` signature inspection stay intact (wrapping in a
@@ -203,16 +204,12 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
     into the compiled graph exactly like the 0.20 attach-before-compile path.
     Idempotent; chat rows (mask False) are exact identity.
     """
-    from .gpu_random import set_route_window
-    set_route_window(route_window)
-
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
 
     owner = _find_decoder_layers(model)
     layers = list(owner.layers)
     state = PoCNativeState(len(layers), hidden_size, max_rows, device, dtype)
-    state.route_window = int(route_window)
 
     emb = getattr(owner, "embed_tokens", None)
     if emb is not None:
@@ -241,6 +238,18 @@ def attach_native_poc(model: nn.Module, hidden_size: int, max_rows: int,
     logger.info("PoC native attached: %d layers patched, %d MoE gates seeded, "
                 "embed patch %s, route window %d", len(layers),
                 len(state.router_meta), state.has_embed_patch, route_window)
+    # Model-agnostic window default (call agreement 2026-08-19): explicit
+    # value (env POC_ROUTE_WINDOW) wins; otherwise FULL SCATTER — window =
+    # n_experts of THIS model (window >= n_experts selects the legacy
+    # full-scatter consensus path; on MiniMax's 256 experts this is exactly
+    # the shipped-golden value 256, bit-identical behaviour). Dense models
+    # (no MoE) get 0 — the window is routing-only and never read.
+    if route_window is None:
+        route_window = state.router_meta[0][0] if state.router_meta else 0
+    state.route_window = int(route_window)
+    from .gpu_random import set_route_window
+    set_route_window(state.route_window)
+
     model._poc_native_state = state
     return state
 
