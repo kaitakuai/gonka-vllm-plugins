@@ -29,3 +29,19 @@ class MixedPoCWorkerExtension(PoCWorkerExtension):
         out = pre_forward.stats()
         out["rank"] = getattr(self, "rank", -1)
         return out
+
+    def mixed_enable_engine_flow(self) -> dict:
+        """Register the PoC-as-a-request hooks (pre: row layout, post: k-snap)
+        on this worker's runner. Requires the residual with BOTH seams
+        (branch mixed/poc-as-request) and POC_ENGINE_FLOW=1."""
+        from . import engine_flow
+        ok = engine_flow.install(self.model_runner)
+        return {"rank": getattr(self, "rank", -1), "installed": bool(ok)}
+
+    def mixed_collect_artifacts(self) -> dict:
+        """Drain finished engine-flow artifacts (k-id chains) accumulated on
+        this worker. Msgpack-safe: ints/lists only."""
+        from . import engine_flow
+        out = engine_flow.FLOW.collect()
+        out["rank"] = getattr(self, "rank", -1)
+        return out

@@ -793,3 +793,27 @@ async def stop_round(request: Request) -> dict:
     if gate is not None:
         gate.deactivate()
     return {"status": "OK", "pow_status": {"status": PoCState.STOPPED.value}}
+
+
+# --- experimental control-plane RPC (branch poc-as-request only) -----------
+# String-dispatched, no imports from gonka_poc.mixed (one-way rule intact).
+# Gated by POC_DEBUG_RPC=1; allow-listed methods only; msgpack-safe returns.
+_DEBUG_RPC_ALLOWED = frozenset({
+    "mixed_enable_pre_forward", "mixed_hook_stats",
+    "mixed_enable_engine_flow", "mixed_collect_artifacts",
+})
+
+
+@router.post("/debug/rpc")
+async def pow_debug_rpc(request: Request):
+    import os
+    if os.environ.get("POC_DEBUG_RPC", "0") != "1":
+        raise HTTPException(status_code=404, detail="disabled")
+    body = await request.json()
+    method = body.get("method", "")
+    if method not in _DEBUG_RPC_ALLOWED:
+        raise HTTPException(status_code=400,
+                            detail=f"method not allowed: {method}")
+    engine_client = await get_engine_client(request)
+    res = await engine_client.collective_rpc(method, kwargs=body.get("kwargs") or {})
+    return {"method": method, "results": res}
