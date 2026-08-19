@@ -337,6 +337,8 @@ class EngineFlow:
             "req_id": rid,
             "nonce": req.nonce,
             "k_points_steps": ks,
+            # полные маржи прувера — материал τ-калибровки (стадия F)
+            "margins": [round(m, 5) for m in margins],
             "margins_head": margins[:8],
             "n_steps": len(ks),
             "aborted": req.aborted or len(ks) < req.max_tokens + 1,
