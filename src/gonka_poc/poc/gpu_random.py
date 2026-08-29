@@ -442,6 +442,25 @@ def random_pick_indices_gpu(
     return chosen.to(torch.int64)
 
 
+# Offset of the forced ladder. The router adds ``e_score_correction_bias``
+# AFTER scoring, so a bias spread wider than the ladder's floor can lift an
+# unforced expert above a forced one and the verdict stops being a property of
+# the seed. The floor is ``scoring_func(lowest forced logit)`` and therefore
+# model-dependent: sigmoid(1)=0.7311, sqrtsoftplus(1)=1.1460.
+#
+# DeepSeek-V4-Flash-0731 has 7 of 43 router-bias tensors wider than 1.1460, the
+# widest 1.6880 (layer 23), so a ladder based at 1 does not hold there. Basing
+# it at 101 puts the floor at sqrtsoftplus(101) = 10.05 — an order of magnitude
+# above the widest spread we have measured on any checkpoint, which also covers
+# Kimi-K2 (0.7832), the model this gate first closed.
+#
+# Side effect, deliberate: the scored weights of the chosen run become nearly
+# uniform (sqrtsoftplus(101..106) spans 10.05..10.30, a 2.5% spread against
+# 114% for the 1..6 ladder). The seeded set stays exactly the same — only how
+# evenly the run is weighted changes.
+LADDER_BASE = 100
+
+
 def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
                    device: torch.device) -> torch.Tensor:
     """THE seeded expert selection — single source of truth for seeded routing.
@@ -453,8 +472,8 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     prover holding EVERY expert; unpredictability of the set is not a goal
     (seeds are public) — consensus security lives in the seeded embeds,
     per-layer reflections and the chained snap. Returns [B, n_experts]
-    forced logits: the chosen run holds descending ladder values top_k..1,
-    the rest a low floor."""
+    forced logits: the chosen run holds descending ladder values
+    ``LADDER_BASE+top_k .. LADDER_BASE+1``, the rest a low floor."""
     b = seed.shape[0]
     start = torch.remainder(seed.view(-1, 1), n_experts)             # [B,1]
     offs = torch.arange(top_k, device=device, dtype=torch.int64)     # [k]
@@ -462,8 +481,9 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     logits = torch.full((b, n_experts), -1.0e4, device=device,
                         dtype=torch.float32)
     logits.scatter_(1, chosen,
-                    torch.arange(top_k, 0, -1, device=device,
-                                 dtype=torch.float32).unsqueeze(0).expand(b, -1))
+                    (torch.arange(top_k, 0, -1, device=device,
+                                  dtype=torch.float32)
+                     + LADDER_BASE).unsqueeze(0).expand(b, -1))
     return logits
 
 
