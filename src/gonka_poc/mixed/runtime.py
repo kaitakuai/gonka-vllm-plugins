@@ -424,6 +424,22 @@ def build_unified_mixed_batch_inputs(
                     poc_len, device=runner.device, dtype=chat_positions.dtype
                 )
                 poc_position_mask[offset:offset + poc_len] = True
+                # Pseudo token ids for the prefill positions. This is where most
+                # of the tid2eid coverage lives on token-id-routed architectures:
+                # seq_len distinct ids per nonce against one per decode step.
+                # Derived by the SAME function the prefill scheme uses, so the two
+                # schemes agree on what a nonce's ids are. No-op elsewhere.
+                _nat0 = getattr(runner, "_poc_native", None)
+                if _nat0 is not None and getattr(_nat0, "token_id_vocab", 0):
+                    from gonka_poc.poc.gpu_random import derive_pseudo_input_ids
+                    _ids = derive_pseudo_input_ids(
+                        poc_params.block_hash, poc_params.public_key,
+                        [poc_params.nonce], poc_len,
+                        _nat0.token_id_vocab, runner.device)
+                    _nat0.set_prefill_token_ids(
+                        torch.arange(offset, offset + poc_len,
+                                     device=runner.device, dtype=torch.long),
+                        _ids)
                 poc_metadata.append({
                     'type': 'poc', 'req_id': req_id, 'start_idx': offset,
                     'length': poc_len, 'poc_params': poc_params,

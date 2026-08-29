@@ -357,6 +357,10 @@ def apply_haar_rotation(
 
 _SALT_DECODE_EMBED = 0x0D
 _SALT_DECODE_PICK = 0x91
+# Token ids for architectures that route by token id (DeepSeek-V4 hash-MoE reads
+# tid2eid[input_ids] in its first num_hash_layers). Its own stream, so the ids
+# stay uncorrelated with the embed and dim-pick streams derived from the same base.
+_SALT_DECODE_TOKEN_ID = 0x57
 _MIX_A = 0x9E3779B1  # golden-ratio odd constant
 _MIX_B = 0x85EBCA77
 
@@ -548,6 +552,31 @@ def derive_pseudo_input_ids(
     # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
     # negligible for routing purposes.
     return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+
+
+def decode_pseudo_token_ids(base_seeds: torch.Tensor, step, prev_k: torch.Tensor,
+                           vocab: int) -> torch.Tensor:
+    """Per-step pseudo token ids for token-id-dependent architectures.
+
+    DeepSeek-V4's first ``num_hash_layers`` layers route through
+    ``tid2eid[input_ids]`` — by TOKEN ID, not by router logits — so the seeded
+    forcing never reaches them. Feeding a constant there (the engine hands PoC
+    rows ``[0] * seq_len``) makes those layers execute one fixed expert set for
+    every nonce and every step: they attest 6 of 256 experts instead of all of
+    them, and the rest of that layer's weights are never exercised by PoC.
+
+    Derived from the SAME (base, step, prev_k) chain as the decode embeds, under
+    its own salt, so the ids are a function of the nonce trajectory and identical
+    on prover and validator by construction. Integer-only, on device, no host
+    sync — the decode chain's efficiency contract.
+
+    Mirrors :func:`derive_pseudo_input_ids`, which does the same job for the
+    prefill scheme; this is its decode-step counterpart.
+    """
+    seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_TOKEN_ID)
+    keys = torch.zeros_like(seeds, dtype=torch.int32).view(-1, 1)
+    return (_batched_murmur3_32(keys, seeds.view(-1, 1)) % vocab).to(
+        torch.int32).flatten()
 
 
 def apply_householder(
