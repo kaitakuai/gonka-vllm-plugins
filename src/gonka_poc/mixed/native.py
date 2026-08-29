@@ -687,6 +687,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # (block_hash,nonce,step,layer) removes that. There is NO non-seeded path. Wrap
     # every MoE gate, discovered generically (any submodule with .gate + a FusedMoE
     # .experts) -> no per-model code. Chat rows are masked out (natural router kept).
+    skipped_hash = 0
     for wrapper in layers:
         inner_layer = getattr(wrapper, "inner", wrapper)
         moe = next(
@@ -695,6 +696,20 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
              and not isinstance(m.gate, PoCRouterWrapper)),
             None)
         if moe is None:
+            continue
+        if getattr(moe.gate, "tid2eid", None) is not None:
+            # Hash-MoE gate (DeepSeek-V4's first num_hash_layers): expert SELECTION
+            # comes from tid2eid[input_ids] -- already deterministic through the
+            # seeded pseudo token ids -- and the gate logits feed only the WEIGHTS,
+            # gathered at the table's indices (bias unused on this path). Forcing
+            # the ladder here would be worse than useless: the table's experts are
+            # almost never inside the seeded run, so their forced logit is the
+            # floor and sqrt(softplus(-1e4)) = 0 -- the routed experts' output is
+            # multiplied by zero and the layer attests nothing. Keep the natural
+            # logits: selection stays deterministic (table), weights become an
+            # ordinary continuous quantity whose cross-HW drift the snap absorbs,
+            # and the experts' weights actually enter the trajectory.
+            skipped_hash += 1
             continue
         n_exp, top_k = _experts_meta(moe.experts)
         # Address-stable per-layer seed base [max_tokens] -> the wrapper folds the
@@ -715,6 +730,9 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         # vs its AWQ checkpoint; disabling restores the 0.20-level gap.
 
     model._poc_native_state = state
+    if skipped_hash:
+        logger.info("PoC hash-MoE gates left natural: %d (selection by seeded "
+                    "pseudo token ids, weights from natural logits)", skipped_hash)
     logger.info(
         "PoC native attach: %d layers, embed=%s, snap=%s, %d MoE routers "
         "seeded%s", len(layers), embed_owner is not None,
