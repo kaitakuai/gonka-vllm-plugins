@@ -36,15 +36,9 @@ class PoCAdmission:
     """Decides which PoC/chat requests may enter the current forward."""
 
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
-                 "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
-                 "_scheduler", "_prefill_landing")
+                 "_token_budget", "_scheduled", "_tokens", "_poc_prefill")
 
     def __init__(self, scheduler, token_budget: int) -> None:
-        self._scheduler = scheduler
-        # Request ids whose PoC PREFILL was scheduled in the PREVIOUS step and
-        # whose output therefore has NOT been processed yet. See skip().
-        self._prefill_landing = getattr(scheduler, "_poc_prefill_landing", None) or set()
-        scheduler._poc_prefill_landing = set()
         queues = (scheduler.running, scheduler.waiting)
         # ONE pass for all four flags. As four separate any() calls, the ones whose
         # answer is "no" walk the whole of running+waiting every step — and on a
@@ -113,21 +107,6 @@ class PoCAdmission:
             return self._defer_chat
         if self._defer_poc or self._scheduled >= self._max_batch:
             return True
-        # A decode row whose PREFILL output has not been processed yet cannot be
-        # computed: the prefill snap is what publishes the nonce's k0, and the
-        # decode input is synthesized from it. num_computed_tokens is advanced at
-        # SCHEDULE time, so it already reads >= seq_len while the prefill forward's
-        # output is still in flight -- the row then reaches the decode branch with
-        # decode_state.prev_k_t = None and the engine dies inside torch.cat
-        # (runtime.py, caught 31.08 at poc_max_batch_size=1, where prefill and the
-        # first decode land in adjacent steps with nothing in between).
-        #
-        # vLLM's async scheduling keeps a batch queue of depth 1: when step N+1 is
-        # scheduled, step N's output is not yet processed; by step N+2 it is. So
-        # deferring the first decode by exactly ONE step closes the race. The cost
-        # is one step per nonce, once, at its prefill->decode transition.
-        if request.request_id in self._prefill_landing:
-            return True
         # Keep a step uniform: never mix a PoC prefill with PoC decode rows.
         return self._poc_prefill and request.num_computed_tokens > 0
 
@@ -154,9 +133,3 @@ class PoCAdmission:
             return
         self._scheduled += 1
         self._tokens += num_new_tokens
-        # Remember rows whose prefill COMPLETES in this step: their output lands
-        # only after the next step is scheduled, so skip() must hold their decode
-        # back for one step.
-        seq_len = request.poc_params.seq_len
-        if request.num_computed_tokens < seq_len <= request.num_computed_tokens + num_new_tokens:
-            self._scheduler._poc_prefill_landing.add(request.request_id)
