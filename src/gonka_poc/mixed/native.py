@@ -21,9 +21,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from gonka_poc.poc.gpu_random import (expert_logits_from_base, generate_householder_vector,
-                         route_base_seed, _seed_from_string, pinned_to_device,
-                         set_route_window)
+from gonka_poc.poc.gpu_random import (generate_householder_vector,
+                                      _seed_from_string)
+from gonka_poc.poc.decode_random import (expert_logits_from_base, route_base_seed,
+                                         pinned_to_device, set_route_window)
 
 # Debug-only TP guard (VLLM_POC_DEBUG_TP=1): PoC reflection vectors / embeds are
 # generated per rank from deterministic seeds and MUST be bit-identical across
@@ -176,7 +177,7 @@ class PoCEmbeddingWrapper(nn.Module):
         # derivation as gpu_random.generate_decode_inputs_gpu, so byte-identical, but
         # it rides the captured forward (no eager RNG on the host between steps).
         # prev_k<0 rows (prefill) fall back to the pre-filled embed.
-        from gonka_poc.poc.gpu_random import (
+        from gonka_poc.poc.decode_random import (
             _step_seeds, _batched_normal_t, _SALT_DECODE_EMBED)
         seeds = _step_seeds(self.embed_base[:n], self.embed_step[:n],
                             self.embed_prev_k[:n], _SALT_DECODE_EMBED)
@@ -205,7 +206,7 @@ class PoCSnapWrapper(nn.Module):
         h = out[0] if isinstance(out, tuple) else out
         st = self._st
         n = h.shape[0]
-        from gonka_poc.poc.gpu_random import random_pick_indices_gpu
+        from gonka_poc.poc.decode_random import random_pick_indices_gpu
         from gonka_poc.poc.sphere import project_to_sphere, snap_with_margin
         lh = h.float()
         lh = lh / (lh.norm(dim=-1, keepdim=True) + 1e-8)

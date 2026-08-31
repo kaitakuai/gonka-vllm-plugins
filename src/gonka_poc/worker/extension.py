@@ -1,42 +1,69 @@
-"""PoCWorkerExtension -- mixed into the vLLM V1 GPU Worker via ``--worker-extension-cls``.
+"""PoCWorkerExtension -- mixed into the vLLM V1 GPU Worker via ``--worker-extension-cls``
+(supported minors per ``gonka_poc._compat``; version-specific surfaces live in
+the compat shim).
 
-Carries BOTH PoC paths, because which one runs is a launch decision:
+Activation:
+    vllm serve <model> --worker-extension-cls gonka_poc.worker.PoCWorkerExtension
 
-* ``--poc-decode`` off (default): ``execute_poc_forward`` -- the v0.1.x
-  prefill scheme, driven over collective_rpc, artifacts bit-identical to the
-  shipped MLNode image. This is what the fleet validates today.
-* ``--poc-decode`` on: nonces ride the serving pipeline as engine requests
-  (routes -> generate(poc_params=...) -> scheduler admission -> runner
-  bridge) and nothing here is used beyond the probes.
-
-How vLLM wires this in (verified on the 0.25.1 line):
-    ``vllm/v1/worker/worker_base.py:263-284`` (WorkerWrapperBase.init_worker)
+How vLLM wires this in (v0.23.0, verified):
+    ``vllm/v1/worker/worker_base.py:261-287`` (WorkerWrapperBase.init_worker)
     resolves the qualname, asserts no attribute collisions with the concrete
-    Worker, then appends the class to ``worker_class.__bases__``. There is NO
-    __init__ -- methods just become attributes on the live Worker.
+    Worker, then does ``worker_class.__bases__ += (PoCWorkerExtension,)``.
+    There is NO __init__ -- methods just become attributes on the live Worker.
 
-Inside any method, ``self`` is the live GPU Worker (self.model_runner,
-self.device, self.rank, self.vllm_config). Keep method names prefixed
-``poc_``/``mixed_``/``execute_poc_``, and return only msgpack-serialisable
-values -- no tensors.
+Inside any method on this class, ``self`` is the live GPU Worker. Available
+attributes:
+    self.model_runner           -- GPUModelRunner (gpu_model_runner.py)
+    self.model_runner.model     -- the nn.Module
+    self.model_runner.kv_caches -- list[torch.Tensor]   (declared L525)
+    self.model_runner.attn_groups -- list[list[AttentionGroup]] (L530)
+    self.device, self.rank, self.vllm_config
+
+Invocation (from the API server / async engine):
+    await async_llm.collective_rpc(
+        "execute_poc_forward",
+        args=(),
+        kwargs={"block_hash": ..., "public_key": ..., "nonces": [...],
+                "seq_len": int, "k_dim": int, "poc_stronger_rng": bool},
+        timeout=POC_RPC_TIMEOUT_MS / 1000,
+    )
+
+    (``collective_rpc`` takes seconds; the env knob is ``POC_RPC_TIMEOUT_MS``,
+    milliseconds, in ``gonka_poc.poc.config``.)
+
+CONTRACT WARNINGS:
+- Method names MUST NOT collide with any public Worker attribute -- vLLM
+  asserts ``not hasattr(worker_class, attr)`` at init_worker time. Keep the
+  ``execute_poc_*`` prefix unique.
+- Return values must be msgpack-serialisable; do NOT return tensors. Return
+  digests / dicts of bytes / ints (artifacts carry vectors as base64 strings
+  via :func:`gonka_poc.poc.data.encode_vector`).
+- Every TP/PP rank executes the method; the API server aggregates results
+  across ranks (PP non-last ranks return ``{"artifacts": [], "rank": ...}``
+  because the underlying forward returns None for them).
 """
-import logging
+from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+
+# NOTE: keep imports light at module scope -- this file is imported in every
+# worker process during init_worker. Heavy imports (torch, gonka_poc.poc.*)
+# are deferred into method bodies.
+#
+# ``gonka_poc._compat`` is intentionally light (pure-Python dispatcher) so
+# it's safe to import at module scope; routing kv_caches access through the
+# shim keeps the documented private-API touchpoint policy honest.
 from gonka_poc._compat import current as _compat_current
 
-logger = logging.getLogger(__name__)
-
-
 class PoCWorkerExtension:
-    """RPC surface for PoC-enabled workers (see module docstring)."""
+    """Add-only methods reachable from ``collective_rpc``.
 
-    def poc_worker_info(self) -> dict:
-        """Liveness/identity probe for operators and tests."""
-        return {
-            "rank": getattr(self, "rank", -1),
-            "device": str(getattr(self, "device", "?")),
-        }
+    See module docstring for the full contract.
+    """
+
+    # ------------------------------------------------------------------ #
+    # PoC forward (the actual GPU work)
+    # ------------------------------------------------------------------ #
 
     def execute_poc_forward(
         self,
@@ -152,4 +179,5 @@ class PoCWorkerExtension:
                 "rank": int(getattr(self, "rank", -1))}
 
 
+# Public alias used in the ``--worker-extension-cls`` CLI string.
 __all__ = ["PoCWorkerExtension"]

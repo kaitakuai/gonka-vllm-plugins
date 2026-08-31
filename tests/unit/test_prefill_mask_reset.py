@@ -1,43 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The prefill forward must run on a model with no PoC rows marked.
+"""A decode round must not leave the PoC row mask set.
 
-The in-model wrappers are gated by a row mask, and a decode round leaves it
-set. The prefill scheme reaches the worker over collective_rpc and never goes
-through the runner bridge that would clear it, so a prefill round following a
-decode round read transformed hidden states: on 1xH100 / Qwen3-1.7B the same
-request returned a different vector_b64 depending on whether a decode round
-had run before it. Reproducible artifacts are the whole point of the proof,
-so the prefill path asserts this itself rather than trusting the other path
-to tidy up.
+The in-model wrappers are gated by that mask. The prefill scheme reaches the
+worker over collective_rpc and never passes through the bridge, so a mask left
+set by a decode round would still be set when the prefill forward runs: on
+1xH100 / Qwen3-1.7B the same request returned a different vector_b64 depending
+on whether a decode round had run before it.
+
+The decode side clears it, because the decode side is what sets it. The
+prefill files stay byte-identical to 0.1.3 and know nothing about this.
 """
-from types import SimpleNamespace
-
-import gonka_poc.poc.poc_model_runner as pmr
+from gonka_poc.mixed.bridge import PoCRunnerBridge
 
 
 class _Native:
     def __init__(self):
-        self.cleared = 0
+        self.mask_set_to = "untouched"
 
     def set_mask(self, row_mask):
-        assert row_mask is None, "prefill marks no rows"
-        self.cleared += 1
+        self.mask_set_to = row_mask
 
 
-def test_prefill_forward_clears_the_row_mask(monkeypatch):
-    """Read the source rather than booting a model: the reset must sit before
-    the forward, and there is no cheaper way to pin ordering."""
-    import inspect
+def _bridge_after_a_poc_step(out):
+    bridge = PoCRunnerBridge.__new__(PoCRunnerBridge)
+    bridge.runner = object()
+    bridge.native = _Native()
+    bridge._step = {"poc_metadata": [{"req_id": "r0"}]}
+    import gonka_poc.mixed.runtime as rt
+    rt.process_poc_outputs_from_hidden = lambda *a, **k: out
+    rt.get_decode_manager = lambda runner: type(
+        "M", (), {"free": staticmethod(lambda rid: None)})()
+    bridge.extract(object())
+    return bridge.native
 
-    src = inspect.getsource(pmr)
-    reset = src.find("set_mask(None)")
-    forward = src.find("with poc_forward_context():")
-    assert reset != -1, "prefill path no longer clears the PoC row mask"
-    assert reset < forward, "the mask is cleared after the forward, too late"
+
+def test_mask_cleared_after_a_round_with_outputs():
+    native = _bridge_after_a_poc_step({"r0": object()})
+    assert native.mask_set_to is None
 
 
-def test_reset_is_skipped_when_no_transforms_are_attached():
-    """A model without the wrappers has no mask to clear; the lookup must not
-    raise on a plain module."""
-    model = SimpleNamespace()
-    assert getattr(model, "_poc_native_state", None) is None
+def test_mask_cleared_even_when_the_round_emitted_nothing():
+    native = _bridge_after_a_poc_step({})
+    assert native.mask_set_to is None

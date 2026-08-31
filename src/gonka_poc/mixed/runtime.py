@@ -61,14 +61,14 @@ def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
     import torch
 
     from gonka_poc.poc.data import encode_vector
-    from gonka_poc.poc.gpu_random import random_pick_indices
+    from gonka_poc.poc.decode_random import random_pick_indices_decode
     from gonka_poc.poc.sphere import SPHERE_DIM
     if debug:
         return [encode_vector(row) for row in q_host]
     cpu = torch.device("cpu")
     out = []
     for step, row in enumerate(q_host):
-        idx = random_pick_indices(
+        idx = random_pick_indices_decode(
             block_hash, public_key, [nonce], SPHERE_DIM, k_dim, cpu, step=step)[0].numpy()
         out.append(encode_vector(row[idx]))
     return out
@@ -80,7 +80,7 @@ def slice_sampling_metadata(sm, rows, device):
     avoids stale/oversized penalty tensors and the per-row param mismatch."""
     import dataclasses
 
-    from gonka_poc.poc.gpu_random import pinned_to_device
+    from gonka_poc.poc.decode_random import pinned_to_device
 
     idx = pinned_to_device(rows, torch.long, device)
     keep = set(rows)
@@ -386,7 +386,7 @@ def build_unified_mixed_batch_inputs(
                 # GPU-native: prev_k is a device tensor (set by the previous step's
                 # output processing) -> no host sync -> async-scheduling safe. The
                 # embedding itself is generated in ONE batched call after the loop.
-                from gonka_poc.poc.gpu_random import decode_base_seeds
+                from gonka_poc.poc.decode_random import decode_base_seeds
                 decode_step = req_state.num_computed_tokens - seq_len + 1
                 if st.base_seeds is None:
                     st.base_seeds = decode_base_seeds(
@@ -450,7 +450,7 @@ def build_unified_mixed_batch_inputs(
 
     # Batched decode-step embeddings: one generate_decode_inputs_gpu call for the
     # whole nonce-batch (per-row identical to the old per-nonce calls).
-    from gonka_poc.poc.gpu_random import generate_decode_inputs_gpu, pinned_to_device
+    from gonka_poc.poc.decode_random import generate_decode_inputs_gpu, pinned_to_device
     decode_offs = (pinned_to_device([j[2] for j in decode_embed_jobs],
                                     torch.long, runner.device)
                    if decode_embed_jobs else None)
@@ -517,9 +517,10 @@ def process_poc_outputs_from_hidden(
     poc_metadata: list[dict],
 ) -> dict[str, "PoCOutput"]:
     from vllm.v1.outputs import PoCOutput
-    from gonka_poc.poc.gpu_random import (
-        random_pick_indices, apply_haar_rotation,
-        decode_base_seeds, random_pick_indices_gpu, pinned_to_device,
+    from gonka_poc.poc.gpu_random import apply_haar_rotation
+    from gonka_poc.poc.decode_random import (
+        random_pick_indices_decode, decode_base_seeds, random_pick_indices_gpu,
+        pinned_to_device,
     )
     from gonka_poc.poc.data import encode_vector
     from gonka_poc.poc.sphere import (
@@ -557,7 +558,7 @@ def process_poc_outputs_from_hidden(
         hidden_size = last_hidden.shape[-1]
 
         def _vector_b64():
-            idx = random_pick_indices(
+            idx = random_pick_indices_decode(
                 poc_params.block_hash, poc_params.public_key, [nonce],
                 hidden_size, poc_params.k_dim, runner.device)
             xk = last_hidden[idx[0]]
@@ -587,7 +588,7 @@ def process_poc_outputs_from_hidden(
         if st.base_seeds is None:
             st.base_seeds = decode_base_seeds(
                 poc_params.block_hash, poc_params.public_key, [nonce], runner.device)
-        sph0 = random_pick_indices(
+        sph0 = random_pick_indices_decode(
             poc_params.block_hash, poc_params.public_key, [nonce],
             hidden_size, SPHERE_DIM, runner.device)
         k0_t, _bad0, margin0, q0 = _sphere_from_idx(sph0)   # [1]/[1]/[1]/[1,SPHERE_DIM]

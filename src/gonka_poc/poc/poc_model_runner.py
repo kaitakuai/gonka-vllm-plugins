@@ -432,18 +432,6 @@ def execute_poc_forward(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
         )
 
-    # The prefill scheme is defined on an UNTOUCHED model: its artifacts are
-    # what the deployed fleet validates, and the in-model wrappers must stay on
-    # their identity branch. They are gated by a row mask that a decode round
-    # leaves set, and this path never goes through the runner bridge that would
-    # clear it -- so a prefill round following a decode round read a
-    # transformed hidden state and produced artifacts nobody can reproduce.
-    # Assert the precondition here rather than trusting the other path to tidy
-    # up after itself.
-    native = getattr(model, "_poc_native_state", None)
-    if native is not None:
-        native.set_mask(None)
-
     with set_forward_context(
         attn_metadata, vllm_config,
         num_tokens=batch_size * seq_len,
@@ -493,8 +481,7 @@ def execute_poc_forward(
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
 
     # Batched k-dim pick + Haar rotation
-    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size,
-                                  k_dim, device, prefill_vector=True)
+    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
     yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
 

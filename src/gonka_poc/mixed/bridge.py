@@ -22,7 +22,7 @@ import torch
 from gonka_poc.mixed.policy import poc_cfg
 
 from vllm.logger import init_logger
-from gonka_poc.poc.gpu_random import pinned_to_device
+from gonka_poc.poc.decode_random import pinned_to_device
 from gonka_poc.mixed import runtime as mixed_decode
 
 if TYPE_CHECKING:
@@ -181,6 +181,14 @@ class PoCRunnerBridge:
             mgr = mixed_decode.get_decode_manager(self.runner)
             for rid in out:
                 mgr.free(rid)
+        # Leave the row mask cleared. The prefill scheme runs its own forward
+        # over collective_rpc and never passes through this bridge, so a mask
+        # left set here would still be set when that forward runs -- the
+        # wrappers would transform its hidden state and its artifacts would
+        # stop matching the shipped image. The decode side clears it, because
+        # the decode side is what sets it; the prefill files stay untouched.
+        if self.native is not None:
+            self.native.set_mask(None)
         return out
 
     # ------------------------------------------------------ sampling exclusion

@@ -1,43 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The prefill scheme must derive exactly as the shipped MLNode image does.
+"""The prefill scheme derives exactly as the shipped MLNode image does.
 
-Verified against the 3.0.16 bundle (gonka_poc 0.1.3): generate_inputs,
-apply_haar_rotation and generate_householder_vector already match bit for bit;
-random_pick_indices was the single divergence, because the decode chain salts
-its seed with the step. Prefill must not carry that salt — a chain that asks
-for the prefill proof gets the artifact the fleet validates today.
-
-The reference formula is spelled out here rather than imported, so this runs
-everywhere instead of skipping like the cross-version parity suite.
+Not by matching a formula, but by construction: ``gpu_random`` IS the 0.1.3
+file, and the decode scheme keeps its own salted draws in ``decode_random``.
+These guard that split, because every regression we chased came from decode
+reaching into the prefill file -- a flag, a branch, a different allocation --
+each of which "kept the values identical" and still moved the artifact.
 """
+import inspect
+
 import pytest
 import torch
 
 from gonka_poc.poc import gpu_random as gr
+from gonka_poc.poc import decode_random as dr
 
 BH, PK, DEV = "block-parity", "pk-parity", torch.device("cpu")
 
 
-def _v01x_pick(nonce, dim, k):
-    """gonka_poc 0.1.3: seed string carries no decode salt."""
-    seed = gr._seed_from_string(f"{BH}_{PK}_nonce_{nonce}_pick_{k}")
-    idx = torch.arange(dim, dtype=torch.int32).unsqueeze(0)
-    scores = gr._batched_murmur3_32(
-        idx, torch.tensor([seed], dtype=torch.int64).unsqueeze(1))
-    return torch.topk(-scores, k=k, largest=True, sorted=False, dim=1).indices[0]
+def test_prefill_pick_takes_no_scheme_flag():
+    """A scheme argument here is how decode leaks into the prefill derivation."""
+    params = set(inspect.signature(gr.random_pick_indices).parameters)
+    assert params == {"block_hash", "public_key", "nonces", "dim", "k", "device"}
 
 
 @pytest.mark.parametrize("nonce", [0, 7, 4242])
-def test_prefill_pick_matches_the_shipped_image(nonce):
-    got = gr.random_pick_indices(BH, PK, [nonce], 512, 12, DEV,
-                                 prefill_vector=True)[0]
-    assert torch.equal(torch.sort(got).values,
-                       torch.sort(_v01x_pick(nonce, 512, 12)).values)
+def test_prefill_pick_carries_no_decode_salt(nonce):
+    """The seed string is the 0.1.3 one: block, key, nonce, k -- and nothing else."""
+    seed = gr._seed_from_string(f"{BH}_{PK}_nonce_{nonce}_pick_12")
+    idx = torch.arange(64, dtype=torch.int32).unsqueeze(0)
+    scores = gr._batched_murmur3_32(
+        idx, torch.tensor([seed], dtype=torch.int64).unsqueeze(1))
+    expected = torch.topk(-scores, k=12, largest=True, sorted=False, dim=1).indices[0]
+    got = gr.random_pick_indices(BH, PK, [nonce], 64, 12, DEV)[0]
+    assert torch.equal(got, expected)
 
 
-def test_decode_pick_keeps_its_own_salt():
-    """The decode chain is a different derivation and must stay one, step 0
-    included, or its golden trajectory moves."""
-    decode = gr.random_pick_indices(BH, PK, [0], 512, 12, DEV)[0]
-    assert not torch.equal(torch.sort(decode).values,
-                           torch.sort(_v01x_pick(0, 512, 12)).values)
+@pytest.mark.parametrize("nonce", [0, 7])
+def test_decode_pick_differs_from_prefill(nonce):
+    """Decode salts with the step, so the two schemes must not agree."""
+    pre = gr.random_pick_indices(BH, PK, [nonce], 64, 12, DEV)[0]
+    dec = dr.random_pick_indices_decode(BH, PK, [nonce], 64, 12, DEV, step=0)[0]
+    assert not torch.equal(pre, dec)
