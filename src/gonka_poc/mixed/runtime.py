@@ -301,10 +301,16 @@ def _cat_prev_k(states, where: str) -> "torch.Tensor":
     ``prev_k_t`` is published by the PREFILL snap. A row can only reach the decode
     path with it still None if its prefill output has not been processed yet —
     ``num_computed_tokens`` is advanced at schedule time, so it reads >= seq_len
-    while the prefill forward is still in flight. The admission gate defers such
-    rows by one step (see mixed/admission.py skip()); this check is the second
-    line, so that a regression there surfaces as a named invariant violation
-    instead of a TypeError from inside torch.cat.
+    while the prefill forward is still in flight.
+
+    Reproduced only at poc_max_batch_size=1, where a nonce's prefill and its first
+    decode land in adjacent steps with nothing in between — a diagnostic setting,
+    not an operating mode. A scheduler-side gate to prevent it was written and then
+    removed: it covered the plain case but not the chunked one, and a half-working
+    prevention only makes a rare race rarer — harder to reproduce, harder to
+    diagnose — while adding cross-step state to the admission path. Detecting it
+    precisely is cheap and complete, so detection is what we keep: the batch fails
+    loudly, its nonces come back empty, and the corpus guard catches them.
 
     Substituting a placeholder here would be WORSE than failing: prev_k < 0 makes
     the embedding wrapper fall back to the prefill embed, so the nonce would keep
@@ -316,8 +322,8 @@ def _cat_prev_k(states, where: str) -> "torch.Tensor":
         raise RuntimeError(
             f"PoC {where}: {len(missing)} of {len(states)} decode rows have no "
             f"prev_k (prefill output not processed yet), rows {missing[:8]}. "
-            "The admission gate should have deferred them by one step — see "
-            "gonka_poc/mixed/admission.py::skip.")
+            "Known race, see this function's docstring; observed only at "
+            "poc_max_batch_size=1.")
     return torch.cat([st.prev_k_t for st in states])
 
 
