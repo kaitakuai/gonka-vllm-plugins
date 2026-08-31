@@ -64,8 +64,22 @@ def s020():
 
 @pytest.fixture(scope="module")
 def gnew():
-    from gonka_poc.poc import gpu_random
-    return gpu_random
+    """The 0.20 file was one module; the port split it in two.
+
+    gpu_random keeps the prefill derivation byte-identical to 0.1.3 and the
+    decode-only draws live in decode_random, so parity against the 0.20
+    reference reads through both.
+    """
+    from gonka_poc.poc import gpu_random, decode_random
+
+    class _Both:
+        def __getattr__(self, name):
+            try:
+                return getattr(gpu_random, name)
+            except AttributeError:
+                return getattr(decode_random, name)
+
+    return _Both()
 
 
 @pytest.fixture(scope="module")
