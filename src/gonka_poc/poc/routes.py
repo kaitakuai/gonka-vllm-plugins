@@ -68,13 +68,6 @@ POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
-_poc_generation_active: bool = False
-
-
-def is_poc_generation_active() -> bool:
-    """Check if POC generation is active (for use by chat endpoint to reject requests)."""
-    return _poc_generation_active
-
 
 def resolve_mining_round(configured: int, engine_client) -> int:
     """How many nonces continuous mining pulls per iteration.
@@ -324,7 +317,6 @@ async def _compute_artifacts_chunk(
     debug: bool = False,
     per_nonce_reflection: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    check_cancelled: Optional[callable] = None,
     block_height: int = 0,
     lease: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
@@ -334,8 +326,6 @@ async def _compute_artifacts_chunk(
     of truth for PoC artifact computation). ``timeout_sec`` is accepted only for
     call compatibility; the scheduler handles queuing/backoff.
     """
-    if check_cancelled and check_cancelled():
-        raise RuntimeError("Cancelled")
     return await compute_nonce_artifacts(
         engine_client, nonces, block_hash, public_key, block_height,
         seq_len, k_dim,
@@ -444,7 +434,6 @@ async def _generation_loop(
 
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    global _poc_generation_active
     logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
@@ -480,18 +469,12 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     if body.url:
         callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
         callback_task = asyncio.create_task(callback_sender.run())
-    
-    # Set the flag BEFORE creating the task so the chat endpoint reflects that
-    # continuous PoC generation is active.
-    _poc_generation_active = True
 
     gen_task = asyncio.create_task(
         _generation_loop(engine_client, stop_event, callback_sender, config, stats)
     )
     
     def _on_generation_done(task: asyncio.Task):
-        global _poc_generation_active
-        _poc_generation_active = False
         if task.cancelled():
             logger.info("PoC generation task cancelled, flag cleared")
         elif task.exception():
@@ -598,15 +581,13 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         await asyncio.sleep(0.1)
     
     total_nonces = len(body.nonces)
-    _step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
-    n_chunks = (total_nonces + _step - 1) // _step
+    step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
+    n_chunks = (total_nonces + step - 1) // step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
-    
+
     start_time = time.time()
     computed_artifacts = []
     poc_decode = body.params.scheme == "decode"
-
-    step = body.batch_size or total_nonces   # 0 = one submission, engine does the batching
 
     # One lease per request, reused across chunks; lease=None => inference has
     # already been aborted and the forward falls back to the legacy in-place
@@ -618,9 +599,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         for i in range(0, total_nonces, step):
             chunk = body.nonces[i:i + step]
             chunk_idx = i // step
-
-            def check_cancelled():
-                return False
 
             while _is_generation_active(app_id):
                 await asyncio.sleep(0.1)
@@ -640,7 +618,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                     debug=body.debug,
                     per_nonce_reflection=body.per_nonce_reflection,
                     timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
-                    check_cancelled=check_cancelled,
                     block_height=body.block_height,
                     lease=lease,
                 )
@@ -742,11 +719,8 @@ async def get_status(request: Request) -> dict:
 
 @router.post("/stop")
 async def stop_round(request: Request) -> dict:
-    global _poc_generation_active
     app_id = id(request.app)
 
     await _cancel_poc_tasks(app_id)
     await clear_queue()
-
-    _poc_generation_active = False
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}

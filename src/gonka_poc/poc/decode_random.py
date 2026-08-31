@@ -14,10 +14,8 @@ import torch
 
 from gonka_poc.poc.gpu_random import (
     _batched_murmur3_32,
-    _batched_normal,
     _normal,
     _seed_from_string,
-    _uniform,
 )
 
 logger = logging.getLogger(__name__)

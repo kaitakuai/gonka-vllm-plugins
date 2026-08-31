@@ -32,33 +32,6 @@ class Encoding:
     endian: str = "le"
 
 
-@dataclass
-class ArtifactBatch:
-    """Batch of artifacts for callback payloads."""
-    public_key: str
-    block_hash: str
-    block_height: int
-    node_id: int
-    artifacts: List[Artifact]
-    encoding: Encoding
-
-
-@dataclass
-class ValidationResult:
-    """Result of artifact validation."""
-    public_key: str
-    block_hash: str
-    block_height: int
-    node_id: int
-    nonces: List[int]
-    n_total: int
-    n_mismatch: int
-    mismatch_nonces: List[int]
-    fraud_threshold: float = DEFAULT_FRAUD_THRESHOLD
-    p_value: Optional[float] = None
-    fraud_detected: Optional[bool] = None
-
-
 def encode_vector(vector: np.ndarray) -> str:
     """Encode FP32 vector to base64 FP16 little-endian."""
     f16 = vector.astype('<f2')  # '<f2' = little-endian float16
