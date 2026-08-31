@@ -122,7 +122,17 @@ async def compute_nonce_artifacts(
                 if not output.finished:
                     continue
                 poc_out = output.poc_output
-                if not poc_out:  # None or empty dict (PoC ran but no artifact)
+                if not poc_out:
+                    # PoC ran but emitted no artifact. Silent until 31.08: the
+                    # nonce was dropped from the result list and the caller saw
+                    # a short batch with no reason given. The dominant cause is
+                    # the KV wall — nonces admitted beyond what the pool holds
+                    # finish without a trajectory, and the ENGINE logs nothing:
+                    # no preemption, no allocation failure. Say it here.
+                    logger.warning(
+                        "PoC nonce %s: no artifact emitted (request finished "
+                        "with empty poc_output). Usually the KV wall — the "
+                        "batch asked for more nonces than the pool holds.", nonce)
                     return None
                 get = poc_out.get if isinstance(poc_out, dict) else (
                     lambda k, d=None: getattr(poc_out, k, d))
@@ -142,13 +152,38 @@ async def compute_nonce_artifacts(
                     sph_vals = get("sph_values_steps", [])
                     if sph_vals:
                         artifact["sph_values_steps"] = sph_vals
+                # Second silent path: the artifact IS emitted but its trajectory
+                # is empty or short. The caller then gets a chain of length 0
+                # among full ones, which a benchmark happily counts as work.
+                # Only a length check catches it, and it costs one len() on data
+                # already in hand — nothing on the happy path.
+                if poc_decode and max_tokens:
+                    got = len(artifact["k_points_steps"])
+                    if got < max_tokens + 1:
+                        logger.warning(
+                            "PoC nonce %s: trajectory %d of %d steps%s. A short "
+                            "chain is NOT work — it must not be scored.",
+                            nonce, got, max_tokens + 1,
+                            " (EMPTY)" if got == 0 else "")
                 return artifact
         except Exception as e:
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
         return None
 
     results = await asyncio.gather(*[compute_one(n) for n in nonces])
-    return [r for r in results if r is not None]
+    out = [r for r in results if r is not None]
+    # Batch-level summary. A per-nonce warning can drown in a 500-nonce round;
+    # this line states the shortfall once, in the terms an operator acts on.
+    dropped = len(nonces) - len(out)
+    short = sum(1 for r in out if poc_decode and max_tokens
+                and len(r.get("k_points_steps") or []) < max_tokens + 1)
+    if dropped or short:
+        logger.warning(
+            "PoC batch of %d: %d nonces produced no artifact, %d returned a "
+            "short trajectory. %d of %d are usable. Lower the batch or raise "
+            "KV — see the per-nonce warnings above.",
+            len(nonces), dropped, short, len(nonces) - dropped - short, len(nonces))
+    return out
 
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
