@@ -7,6 +7,7 @@ allocation to it. Shared primitives are imported, never copied: both schemes
 must hash and draw through the exact same code.
 """
 import logging
+import math
 from typing import List, Optional
 
 import torch
