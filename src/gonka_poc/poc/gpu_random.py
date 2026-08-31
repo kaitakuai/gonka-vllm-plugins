@@ -1,64 +1,22 @@
-"""Deterministic GPU-based random generation for PoC.
+"""Deterministic seeded RNG primitives for the PoC forward.
 
-Core primitives for generating reproducible random tensors seeded by
-(block_hash, public_key, nonce). Used by the production inference pipeline.
+Reproducible random tensors seeded by (block_hash, public_key, nonce).
 
-OPTIMIZED: Serial Python loops replaced with batched GPU operations.
+CONSENSUS-CRITICAL, in this precise sense: prover and validator derive the
+model's input vectors INDEPENDENTLY, each running these functions on its own
+hardware. Validation then compares the resulting model outputs statistically
+(per-nonce L2 distance against a threshold, then a binomial test over the
+mismatch count) -- numeric noise within the tolerance is expected and passes.
+What must therefore stay fixed is the DERIVATION ALGORITHM: a node running a
+different derivation produces input vectors unrelated to the fleet's, its
+outputs land beyond the threshold on every nonce, and an honest node fails
+validation. Bitwise equality of outputs is neither required nor checked.
 """
 import hashlib
 import math
-from typing import List, Optional
+from typing import List
 
 import torch
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-# Seeded-routing scatter fix (DURABLE DEFAULT — MoE decode-PoC).
-# Without it, each token seed-picks top_k of ALL n_experts, so a 32-token decode batch
-# scatters across ~all experts -> the MoE grouped GEMM streams ~n_experts weight matrices
-# from HBM every step. Measured on MiniMax-M2 (256 experts) in graph mode: MoE = 8.9 ms/step,
-# 11x pure inference's 0.8 ms and 56% of PoC's GPU time. This restricts every token's pick to
-# a shared, step-rotating WINDOW of _ROUTE_WINDOW experts, so the batch activates only ~W
-# distinct experts/step (grouped GEMM batches them) while the window slides each step so the
-# trajectory still sweeps every expert (coverage / fraud-bound preserved). Fully seeded ->
-# deterministic, bit-identical eager==graph, no cross-HW noise. Verified in graph: 8.9 -> 4.0
-# ms/step MoE (single-nonce validation collapses to ~W and is faster still). Per-row-step
-# offset (not batch-shared) keeps each nonce's artifact reproducible by a single-nonce
-# validator. CONSENSUS-AFFECTING (changes k-trajectories) -> needs coordinated recollection.
-# Set >= n_experts (e.g. a huge value) only to restore the legacy full-scatter behaviour.
-# CONSENSUS-AFFECTING: changing it changes the k-trajectories. Configured via the
-# broadcast engine config (--poc-route-window -> CacheConfig.poc_route_window), pushed
-# here once per worker by set_route_window() at model attach (native.attach_native_poc),
-# BEFORE graph capture -> one value across all TP workers, no env-propagation gap.
-# Default 256 == production spec (full scatter on MiniMax's 256 experts; the
-# fairness decision of 2026-08-08): window >= n_experts uses the legacy
-# _forced_logits full-scatter branch.
-_ROUTE_WINDOW = 0  # retired: the contiguous-run pick has no window
-
-
-def set_route_window(n: int) -> None:
-    """Deprecated no-op: the windowed pick is retired (contiguous-run
-    formula). Kept so existing config plumbing does not break."""
-    if int(n) not in (0, 256):
-        logger.warning("poc_route_window=%d ignored: windowed pick retired", n)
-
-
-def pinned_to_device(vals, dtype, device):
-    """Build a small [N] device tensor from a host sequence WITHOUT stalling the
-    async pipeline.
-
-    `torch.tensor(list, device='cuda')` — and indexing a CUDA tensor with a Python
-    list — construct on-device via a BLOCKING host->device copy that synchronizes
-    on the compute stream. Under async scheduling that stalls every decode step on
-    the model forward (measured ~17 ms/step; see the decode-PoC tail). Building a
-    pinned host tensor and copying non_blocking avoids the sync. The values are
-    identical to the direct construction, so PoC artifacts stay bit-for-bit the
-    same — do NOT "simplify" this back to torch.tensor(..., device=cuda).
-    """
-    cuda = torch.device(device).type == "cuda"
-    return torch.tensor(vals, dtype=dtype, pin_memory=cuda).to(device, non_blocking=cuda)
 
 
 def _seed_from_string(seed_string: str) -> int:
@@ -66,6 +24,9 @@ def _seed_from_string(seed_string: str) -> int:
     return int(h[:8], 16)
 
 
+# _murmur3_32/_batched_murmur3_32 are kept separate deliberately: the fleet
+# derives inputs with these exact code paths. Do not unify without a
+# cross-validator harness proving the derivation is unchanged.
 def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
     """Murmur3 hash for int32 keys. Returns int64 to preserve full uint32 range."""
     c1, c2 = 0xCC9E2D51, 0x1B873593
@@ -119,6 +80,9 @@ def _batched_murmur3_32(keys: torch.Tensor, seeds: torch.Tensor) -> torch.Tensor
     return h
 
 
+# _normal/_batched_normal are kept separate deliberately: the fleet derives
+# inputs with these exact code paths. Do not unify without a cross-validator
+# harness proving the derivation is unchanged.
 def _batched_normal(seeds: list, n: int, device: torch.device) -> torch.Tensor:
     """Generate batched normal random numbers for multiple seeds.
 
@@ -174,14 +138,15 @@ def generate_inputs(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    """Generate deterministic input embeddings for PoC.
-
-    Batched: ONE _batched_normal over all nonces instead of a serial per-nonce
-    Python loop (which was ~B sequential big RNGs on the prefill critical path).
-    Per-row identical to the old loop (same seed -> same murmur -> same normals)."""
-    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{n}") for n in nonces]
-    normals = _batched_normal(seeds, seq_len * dim, device)  # [B, seq_len*dim]
-    return normals.view(len(nonces), seq_len, dim).to(dtype)
+    """Generate deterministic input embeddings for PoC."""
+    batch_size = len(nonces)
+    result = torch.empty(batch_size, seq_len, dim, device=device, dtype=dtype)
+    for i, nonce in enumerate(nonces):
+        seed_str = f"{block_hash}_{public_key}_nonce{nonce}"
+        seed = _seed_from_string(seed_str)
+        normal = _normal(seed, seq_len * dim, device)
+        result[i] = normal.view(seq_len, dim).to(dtype)
+    return result
 
 
 def generate_inputs_concat_murmur(
@@ -221,6 +186,33 @@ def generate_inputs_concat_murmur(
     return result
 
 
+def derive_pseudo_input_ids(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    seq_len: int,
+    vocab: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Deterministic pseudo token ids for token-id-dependent architectures.
+
+    Ids are derived from the same ``(block_hash, public_key, nonce)`` seed
+    scheme as the input embeddings (``_input_ids`` suffix), through the same
+    framework-independent murmur3 pipeline — pure integer arithmetic, stable
+    across torch versions (a consensus requirement).
+    """
+    batch_size = len(nonces)
+    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
+    keys = keys.unsqueeze(0).expand(batch_size, -1)
+    seeds = torch.tensor(
+        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
+         for n in nonces],
+        dtype=torch.int64, device=device)
+    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
+    # negligible for routing purposes.
+    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
+
+
 def generate_householder_vector(
     seed_str: str,
     dim: int,
@@ -232,32 +224,13 @@ def generate_householder_vector(
     return v / v.norm()
 
 
-def generate_decode_inputs(
-    block_hash: str,
-    public_key: str,
-    nonces: List[int],
-    prev_k: List[int],
-    step: int,
-    dim: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float16,
+def apply_householder(
+    x: torch.Tensor,
+    v: torch.Tensor,
 ) -> torch.Tensor:
-    """Generate deterministic decode-step embedding chained to the previous sphere_k.
-
-    The seed incorporates prev_k so each decode step is deterministically
-    linked to its predecessor.
-
-    Returns:
-        Tensor of shape [batch_size, 1, dim]
-    """
-    batch_size = len(nonces)
-    result = torch.empty(batch_size, 1, dim, device=device, dtype=dtype)
-    for i, (nonce, k) in enumerate(zip(nonces, prev_k)):
-        seed_str = f"{block_hash}_{public_key}_nonce{nonce}_decode{step}_k{k}"
-        seed = _seed_from_string(seed_str)
-        normal = _normal(seed, dim, device)
-        result[i, 0] = normal.to(dtype)
-    return result
+    """Apply Householder reflection: H @ x = x - 2*(v.x)*v"""
+    dot = (x * v).sum(dim=-1, keepdim=True)
+    return x - 2 * dot * v
 
 
 def random_pick_indices(
@@ -267,36 +240,18 @@ def random_pick_indices(
     dim: int,
     k: int,
     device: torch.device,
-    prev_point_ids: Optional[List[int]] = None,
-    step: int = 0,
-    prefill_vector: bool = False,
 ) -> torch.Tensor:
-    """Pick k dimensions per nonce deterministically (vectorized).
-
-    When prev_point_ids is provided the seed is mixed with the previous
-    sphere index so decode steps pick a different subset than prefill.
-    """
+    """Pick k dimensions per nonce deterministically (vectorized)."""
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
 
     batch_size = len(nonces)
 
     seeds = []
-    for i, nonce in enumerate(nonces):
-        if prefill_vector:
-            # v0.1.x seeding, no decode salt: the derivation the deployed
-            # fleet validates. Verified against the shipped MLNode image.
-            seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
-            ))
-        elif prev_point_ids is None:
-            seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}"
-            ))
-        else:
-            seeds.append(_seed_from_string(
-                f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}_k_{prev_point_ids[i]}"
-            ))
+    for nonce in nonces:
+        seeds.append(_seed_from_string(
+            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+        ))
 
     all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
     seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)
@@ -338,203 +293,3 @@ def apply_haar_rotation(
         y = y - 2 * dot * v_batch
 
     return y
-
-
-# ---------------------------------------------------------------------------
-# GPU-native decode chaining
-# ---------------------------------------------------------------------------
-# The decode trajectory chains each step's seed to the PREVIOUS step's sphere_k
-# (prev_k) so a prover must run the model step by step. The legacy path builds
-# that seed with SHA256 of a string containing prev_k -> prev_k must be a Python
-# int -> a GPU->CPU sync every step -> forces --no-async-scheduling.
-#
-# These functions keep prev_k on the GPU as a tensor and mix it in with on-GPU
-# murmur3 (already used everywhere here). block_hash/public_key/nonce are CONSTANT
-# per request, so their SHA256 base seed is computed ONCE (no per-step sync); only
-# step + prev_k are mixed per step, fully on device. This is a NEW seed scheme
-# (values differ from the SHA256-string path) -> adopt before decode-PoC deploys.
-# Distinct salts separate the decode-embed stream from the dim-pick stream.
-
-_SALT_DECODE_EMBED = 0x0D
-_SALT_DECODE_PICK = 0x91
-_MIX_A = 0x9E3779B1  # golden-ratio odd constant
-_MIX_B = 0x85EBCA77
-
-
-def decode_base_seeds(
-    block_hash: str,
-    public_key: str,
-    nonces: List[int],
-    device: torch.device,
-) -> torch.Tensor:
-    """Per-nonce base seed (constant for the whole request) -> [B] int64 on device.
-    Computed once; carries no per-step dependency, so the host SHA256 here is fine."""
-    seeds = [_seed_from_string(f"{block_hash}_{public_key}_nonce{n}") for n in nonces]
-    return torch.tensor(seeds, dtype=torch.int64, device=device)
-
-
-def _step_seeds(
-    base_seeds: torch.Tensor, step: int, prev_k: torch.Tensor, salt: int
-) -> torch.Tensor:
-    """Per-step seed = on-GPU murmur3 mixing base (per nonce) with step + prev_k.
-
-    base_seeds [B] int64 (constant), prev_k [B] int64 (chained on device, NEVER
-    .item()'d). step is a host int (same for the whole batch) OR a [B] int64 tensor
-    (per-row step, so a whole nonce-batch can be chained in ONE call). Returns [B]
-    int64 fully on device, so the decode chain has no GPU->CPU sync. Avalanche from
-    murmur3 makes consecutive steps / prev_k values uncorrelated (same property the
-    SHA256 path gave). The per-row result is identical to calling this once per row."""
-    if torch.is_tensor(step):
-        step_term = step.to(torch.int64).view(-1) * _MIX_B + salt
-    else:
-        step_term = int(step) * _MIX_B + salt
-    key = ((prev_k.to(torch.int64).view(-1) & 0xFFFFFFFF) * _MIX_A
-           + step_term) & 0xFFFFFFFF
-    return _batched_murmur3_32(key.view(-1, 1), base_seeds.view(-1, 1)).view(-1)
-
-
-def _batched_normal_t(seeds: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
-    """Like _batched_normal but `seeds` is already an int64 tensor [B] (no host
-    list). Returns [B, n] standard normals, fully on device."""
-    batch_size = seeds.shape[0]
-    n_pairs = (n + 1) // 2
-    total = n_pairs * 2
-    indices = torch.arange(total, device=device, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1)
-    h = _batched_murmur3_32(indices, seeds.view(-1, 1))
-    u = h.to(torch.float32) / 4294967296.0
-    u1 = torch.clamp(u[:, :n_pairs], min=1e-10)
-    u2 = u[:, n_pairs:]
-    z0 = torch.sqrt(-2.0 * torch.log(u1)) * torch.cos(2.0 * math.pi * u2)
-    z1 = torch.sqrt(-2.0 * torch.log(u1)) * torch.sin(2.0 * math.pi * u2)
-    return torch.cat([z0, z1], dim=1)[:, :n]
-
-
-def generate_decode_inputs_gpu(
-    base_seeds: torch.Tensor,
-    prev_k: torch.Tensor,
-    step: int,
-    dim: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    """GPU-native counterpart of generate_decode_inputs: next decode-step input
-    embedding chained to prev_k (tensor). Returns [B, 1, dim]."""
-    seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_EMBED)
-    return _batched_normal_t(seeds, dim, device).to(dtype).unsqueeze(1)
-
-
-def random_pick_indices_gpu(
-    base_seeds: torch.Tensor,
-    prev_k: torch.Tensor,
-    step: int,
-    dim: int,
-    k: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """GPU-native counterpart of random_pick_indices (decode): k dims per row,
-    seed chained to prev_k (tensor). Returns [B, k] int64."""
-    if k <= 0 or k > dim:
-        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
-    seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_PICK)
-    all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(seeds.shape[0], -1)
-    scores = _batched_murmur3_32(all_idx, seeds.view(-1, 1))
-    _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
-    return chosen.to(torch.int64)
-
-
-def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
-                   device: torch.device) -> torch.Tensor:
-    """THE seeded expert selection — single source of truth for seeded routing.
-
-    Contiguous seeded run: ``start = seed % n_experts``, experts
-    ``start .. start+top_k-1`` (mod n). Distinct by construction for ANY
-    n_experts, one arithmetic op, trivial to reimplement bit-exactly in the
-    chain-side validator. Uniform per-expert coverage across seeds keeps the
-    prover holding EVERY expert; unpredictability of the set is not a goal
-    (seeds are public) — consensus security lives in the seeded embeds,
-    per-layer reflections and the chained snap. Returns [B, n_experts]
-    forced logits: the chosen run holds descending ladder values top_k..1,
-    the rest a low floor."""
-    b = seed.shape[0]
-    start = torch.remainder(seed.view(-1, 1), n_experts)             # [B,1]
-    offs = torch.arange(top_k, device=device, dtype=torch.int64)     # [k]
-    chosen = torch.remainder(start + offs.unsqueeze(0), n_experts)   # [B,k]
-    logits = torch.full((b, n_experts), -1.0e4, device=device,
-                        dtype=torch.float32)
-    logits.scatter_(1, chosen,
-                    torch.arange(top_k, 0, -1, device=device,
-                                 dtype=torch.float32).unsqueeze(0).expand(b, -1))
-    return logits
-
-
-def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
-    """STABLE part of the routing seed: (block_hash, nonce, layer) — everything except
-    the decode step. sha256'd ONCE per (block_hash,nonce,layer) and cached across all
-    decode steps; ``step`` is folded in on-GPU per step (see expert_logits_from_base).
-    This is the efficiency contract: NO per-step string hashing (the K-calc lesson)."""
-    return f"{block_hash}_n{nonce}_route_layer_{layer}"
-
-
-def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
-                            n_experts: int, top_k: int,
-                            device: torch.device) -> torch.Tensor:
-    """Per-row forced router logits: fold the decode ``step`` into the cached base seed
-    ON GPU, then the shared _forced_logits pick. ``base_ints``/``steps`` are [B]
-    int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
-    device->host sync. Equivalent per (row, layer) to seeded_experts()."""
-    seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
-                               base_ints.view(-1, 1))               # [B,1] = fold step into base
-    return _forced_logits(seed, n_experts, top_k, device)
-
-
-def seeded_experts(block_hash: str, nonce: int, step: int, layer: int,
-                   n_experts: int, top_k: int, device: torch.device) -> torch.Tensor:
-    """Reference (single-row) seeded experts = the EXACT live derivation: cached
-    sha256 base (block_hash+nonce+layer) then on-GPU ``step`` fold. Returns the chosen
-    expert indices. For tests / offline validators (the live runner uses the batched,
-    cached expert_logits_from_base, which is identical per row)."""
-    base = torch.tensor([_seed_from_string(route_base_seed(block_hash, nonce, layer))],
-                        dtype=torch.int64, device=device)
-    steps = torch.tensor([step], dtype=torch.int64, device=device)
-    logits = expert_logits_from_base(base, steps, n_experts, top_k, device)[0]
-    return torch.topk(logits, top_k).indices
-
-# --- v0.1.x prefill scheme ------------------------------------------------
-# Used only when the node runs without --poc-decode. The decode stack has no
-# use for them, but removing them broke the prefill path outright.
-
-def derive_pseudo_input_ids(
-    block_hash: str,
-    public_key: str,
-    nonces: List[int],
-    seq_len: int,
-    vocab: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Deterministic pseudo token ids for token-id-dependent architectures.
-
-    Ids are derived from the same ``(block_hash, public_key, nonce)`` seed
-    scheme as the input embeddings (``_input_ids`` suffix), through the same
-    framework-independent murmur3 pipeline — pure integer arithmetic, stable
-    across torch versions (a consensus requirement).
-    """
-    batch_size = len(nonces)
-    keys = torch.arange(seq_len, dtype=torch.int32, device=device)
-    keys = keys.unsqueeze(0).expand(batch_size, -1)
-    seeds = torch.tensor(
-        [[_seed_from_string(f"{block_hash}_{public_key}_nonce{n}_input_ids")]
-         for n in nonces],
-        dtype=torch.int64, device=device)
-    # murmur3 yields uniform uint32; modulo bias at vocab << 2^32 is
-    # negligible for routing purposes.
-    return (_batched_murmur3_32(keys, seeds) % vocab).to(torch.int32).flatten()
-
-
-def apply_householder(
-    x: torch.Tensor,
-    v: torch.Tensor,
-) -> torch.Tensor:
-    """Apply Householder reflection: H @ x = x - 2*(v.x)*v"""
-    dot = (x * v).sum(dim=-1, keepdim=True)
-    return x - 2 * dot * v
-

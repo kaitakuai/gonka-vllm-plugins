@@ -1,5 +1,6 @@
 """PoC API routes for vLLM server."""
 import asyncio
+import contextlib
 import os
 import time
 import uuid
@@ -17,6 +18,7 @@ from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
     compute_nonce_artifacts,
 )
+from gonka_poc.poc.reservation import poc_reservation
 from gonka_poc.poc.validation import run_validation
 
 logger = logging.getLogger(__name__)
@@ -66,13 +68,6 @@ POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
-_poc_generation_active: bool = False
-
-
-def is_poc_generation_active() -> bool:
-    """Check if POC generation is active (for use by chat endpoint to reject requests)."""
-    return _poc_generation_active
-
 
 def resolve_mining_round(configured: int, engine_client) -> int:
     """How many nonces continuous mining pulls per iteration.
@@ -322,18 +317,15 @@ async def _compute_artifacts_chunk(
     debug: bool = False,
     per_nonce_reflection: bool = False,
     timeout_sec: float = POC_GENERATE_CHUNK_TIMEOUT_SEC,
-    check_cancelled: Optional[callable] = None,
     block_height: int = 0,
+    lease: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """Compute artifacts for a chunk of nonces via the scheduler.
 
     Thin wrapper over generate_queue.compute_nonce_artifacts (the single source
-    of truth for PoC artifact computation). ``poc_stronger_rng``/``timeout_sec``
-    are accepted only for call compatibility; ``poc_stronger_rng`` is not a
-    PoCParams field and the scheduler handles queuing/backoff.
+    of truth for PoC artifact computation). ``timeout_sec`` is accepted only for
+    call compatibility; the scheduler handles queuing/backoff.
     """
-    if check_cancelled and check_cancelled():
-        raise RuntimeError("Cancelled")
     return await compute_nonce_artifacts(
         engine_client, nonces, block_hash, public_key, block_height,
         seq_len, k_dim,
@@ -342,6 +334,8 @@ async def _compute_artifacts_chunk(
         enforced_k_steps=enforced_k_steps,
         debug=debug,
         per_nonce_reflection=per_nonce_reflection,
+        poc_stronger_rng=poc_stronger_rng,
+        lease=lease,
     )
 
 
@@ -440,7 +434,6 @@ async def _generation_loop(
 
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    global _poc_generation_active
     logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
@@ -476,18 +469,12 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     if body.url:
         callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
         callback_task = asyncio.create_task(callback_sender.run())
-    
-    # Set the flag BEFORE creating the task so the chat endpoint reflects that
-    # continuous PoC generation is active.
-    _poc_generation_active = True
 
     gen_task = asyncio.create_task(
         _generation_loop(engine_client, stop_event, callback_sender, config, stats)
     )
     
     def _on_generation_done(task: asyncio.Task):
-        global _poc_generation_active
-        _poc_generation_active = False
         if task.cancelled():
             logger.info("PoC generation task cancelled, flag cleared")
         elif task.exception():
@@ -594,47 +581,50 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         await asyncio.sleep(0.1)
     
     total_nonces = len(body.nonces)
-    _step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
-    n_chunks = (total_nonces + _step - 1) // _step
+    step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
+    n_chunks = (total_nonces + step - 1) // step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
-    
+
     start_time = time.time()
     computed_artifacts = []
     poc_decode = body.params.scheme == "decode"
 
-    step = body.batch_size or total_nonces   # 0 = one submission, engine does the batching
-    for i in range(0, total_nonces, step):
-        chunk = body.nonces[i:i + step]
-        chunk_idx = i // step
+    # One lease per request, reused across chunks; lease=None => inference has
+    # already been aborted and the forward falls back to the legacy in-place
+    # layout over blocks 0..N -- see poc_reservation. Decode is deliberately
+    # left outside: it shares the scheduler with live chat by design.
+    async with contextlib.AsyncExitStack() as _stack:
+        lease = None if poc_decode else await _stack.enter_async_context(
+            poc_reservation(engine_client, step, body.params.seq_len))
+        for i in range(0, total_nonces, step):
+            chunk = body.nonces[i:i + step]
+            chunk_idx = i // step
 
-        def check_cancelled():
-            return False
+            while _is_generation_active(app_id):
+                await asyncio.sleep(0.1)
 
-        while _is_generation_active(app_id):
-            await asyncio.sleep(0.1)
+            chunk_inference_steps = None
+            if body.enforced_k_steps:
+                chunk_inference_steps = {n: body.enforced_k_steps[n]
+                                         for n in chunk if n in body.enforced_k_steps}
 
-        chunk_inference_steps = None
-        if body.enforced_k_steps:
-            chunk_inference_steps = {n: body.enforced_k_steps[n]
-                                     for n in chunk if n in body.enforced_k_steps}
-
-        try:
-            artifacts = await _compute_artifacts_chunk(
-                engine_client, chunk, body.block_hash, body.public_key,
-                body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
-                poc_decode=poc_decode,
-                max_tokens=body.params.max_tokens,
-                enforced_k_steps=chunk_inference_steps,
-                debug=body.debug,
-                per_nonce_reflection=body.per_nonce_reflection,
-                timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
-                check_cancelled=check_cancelled,
-                block_height=body.block_height,
-            )
-            computed_artifacts.extend(artifacts)
-            logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
-        except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+            try:
+                artifacts = await _compute_artifacts_chunk(
+                    engine_client, chunk, body.block_hash, body.public_key,
+                    body.params.seq_len, body.params.k_dim, body.poc_stronger_rng,
+                    poc_decode=poc_decode,
+                    max_tokens=body.params.max_tokens,
+                    enforced_k_steps=chunk_inference_steps,
+                    debug=body.debug,
+                    per_nonce_reflection=body.per_nonce_reflection,
+                    timeout_sec=POC_GENERATE_CHUNK_TIMEOUT_SEC,
+                    block_height=body.block_height,
+                    lease=lease,
+                )
+                computed_artifacts.extend(artifacts)
+                logger.debug(f"PoC /generate: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+            except RuntimeError as e:
+                raise HTTPException(status_code=503, detail=str(e))
     
     elapsed = time.time() - start_time
     rate = total_nonces / elapsed if elapsed > 0 else 0
@@ -729,11 +719,8 @@ async def get_status(request: Request) -> dict:
 
 @router.post("/stop")
 async def stop_round(request: Request) -> dict:
-    global _poc_generation_active
     app_id = id(request.app)
 
     await _cancel_poc_tasks(app_id)
     await clear_queue()
-
-    _poc_generation_active = False
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}

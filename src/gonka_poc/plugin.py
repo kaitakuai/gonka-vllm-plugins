@@ -77,6 +77,17 @@ def register() -> None:
             "gonka_poc.plugin.register: build_app warning wrapper install failed"
         )
 
+    try:
+        from gonka_poc._compat import current as _compat_current
+
+        _compat_current().install_engine_core_poc_methods()
+    except Exception as exc:
+        # Unsupported vllm minor / import quirk: validation degrades to the
+        # legacy abort-based path, never a crash at plugin load.
+        logger.debug(
+            "gonka_poc.plugin.register: EngineCore borrow install skipped: %s",
+            exc)
+
     _registered = True
 
 

@@ -1,32 +1,12 @@
-# PoC runs through the engine scheduler via generate(poc_params=...).
-# No collective_rpc monkeypatch.
-from .config import PoCConfig, PoCState
-from .data import (
-    Artifact,
-    Encoding,
-    ArtifactBatch,
-    ValidationResult,
-    encode_vector,
-    decode_vector,
-    is_mismatch,
-    fraud_test,
-    compare_artifacts,
-)
-from .routes import router as poc_router
-from .poc_params import PoCParams
+"""PoC sub-package.
 
-__all__ = [
-    "PoCConfig",
-    "PoCState",
-    "PoCParams",
-    "Artifact",
-    "Encoding",
-    "ArtifactBatch",
-    "ValidationResult",
-    "encode_vector",
-    "decode_vector",
-    "is_mismatch",
-    "fraud_test",
-    "compare_artifacts",
-    "poc_router",
-]
+Intentionally inert: importing ``gonka_poc.poc`` MUST NOT trigger any side
+effects. Consumers pull what they need from the explicit module path::
+
+    from gonka_poc.poc.routes import router as poc_router
+    from gonka_poc.poc.data import encode_vector, decode_vector
+    from gonka_poc.poc.poc_model_runner import execute_poc_forward
+
+Re-exporting here drags the API layer -- and through it vLLM -- into every
+process that only wanted the worker extension.
+"""

@@ -1,5 +1,6 @@
 """PoC generate queue with bounded nonce cap and result store."""
 import asyncio
+import contextlib
 import os
 import time
 import uuid
@@ -11,6 +12,7 @@ from gonka_poc.poc.validation import run_validation
 from gonka_poc.poc.callbacks import get_callback_queue, clear_callback_queue
 from gonka_poc.poc.data import DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
 from gonka_poc.poc.poc_params import PoCParams
+from gonka_poc.poc.reservation import poc_reservation
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ async def compute_nonce_artifacts(
     enforced_k_steps: Optional[Dict[int, List[int]]] = None,
     debug: bool = False,
     per_nonce_reflection: bool = False,
+    poc_stronger_rng: bool = False,
+    lease: Optional[dict] = None,
 ) -> List[dict]:
     """Compute PoC artifacts for a set of nonces.
 
@@ -84,6 +88,8 @@ async def compute_nonce_artifacts(
             public_key=public_key,
             seq_len=seq_len,
             k_dim=k_dim,
+            poc_stronger_rng=poc_stronger_rng,
+            lease=lease,
         )
 
     async def compute_one(nonce: int) -> Optional[dict]:
@@ -362,37 +368,44 @@ class GenerateQueue:
         start_time = time.time()
         computed_artifacts = []
 
-        for i in range(0, total_nonces, step):
-            chunk = job.nonces[i:i + step]
-            chunk_idx = i // step
+        # One lease per job, reused across chunks -- see poc_reservation.
+        # Decode stays outside it: it shares the scheduler with live chat.
+        async with contextlib.AsyncExitStack() as _stack:
+            lease = None if job.poc_decode else await _stack.enter_async_context(
+                poc_reservation(job.engine_client, step, job.seq_len))
+            for i in range(0, total_nonces, step):
+                chunk = job.nonces[i:i + step]
+                chunk_idx = i // step
 
-            if self._stop_event.is_set():
-                raise RuntimeError("Job cancelled")
+                if self._stop_event.is_set():
+                    raise RuntimeError("Job cancelled")
 
-            chunk_inference_steps = None
-            if job.enforced_k_steps:
-                chunk_inference_steps = {
-                    n: job.enforced_k_steps[n]
-                    for n in chunk if n in job.enforced_k_steps
-                }
+                chunk_inference_steps = None
+                if job.enforced_k_steps:
+                    chunk_inference_steps = {
+                        n: job.enforced_k_steps[n]
+                        for n in chunk if n in job.enforced_k_steps
+                    }
 
-            try:
-                artifacts = await compute_nonce_artifacts(
-                    job.engine_client, chunk,
-                    job.block_hash, job.public_key, job.block_height,
-                    job.seq_len, job.k_dim,
-                    poc_decode=job.poc_decode,
-                    max_tokens=job.max_tokens,
-                    enforced_k_steps=chunk_inference_steps,
-                    debug=job.debug,
-                    per_nonce_reflection=job.per_nonce_reflection,
-                )
-            except asyncio.CancelledError:
-                logger.info(f"PoC queue job {job.request_id[:8]}: cancelled")
-                raise RuntimeError("Job cancelled")
+                try:
+                    artifacts = await compute_nonce_artifacts(
+                        job.engine_client, chunk,
+                        job.block_hash, job.public_key, job.block_height,
+                        job.seq_len, job.k_dim,
+                        poc_decode=job.poc_decode,
+                        max_tokens=job.max_tokens,
+                        enforced_k_steps=chunk_inference_steps,
+                        debug=job.debug,
+                        per_nonce_reflection=job.per_nonce_reflection,
+                        poc_stronger_rng=job.poc_stronger_rng,
+                        lease=lease,
+                    )
+                except asyncio.CancelledError:
+                    logger.info(f"PoC queue job {job.request_id[:8]}: cancelled")
+                    raise RuntimeError("Job cancelled")
 
-            computed_artifacts.extend(artifacts)
-            logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
+                computed_artifacts.extend(artifacts)
+                logger.debug(f"PoC queue job {job.request_id[:8]}: chunk {chunk_idx+1}/{n_chunks} done ({len(chunk)} nonces)")
 
         elapsed = time.time() - start_time
         rate = total_nonces / elapsed if elapsed > 0 else 0

@@ -25,8 +25,8 @@ import pytest
 import torch
 
 from gonka_poc.mixed.native import PoCNativeState
-from gonka_poc.poc.gpu_random import (_seed_from_string, decode_base_seeds,
-                                 route_base_seed)
+from gonka_poc.poc.gpu_random import _seed_from_string
+from gonka_poc.poc.decode_random import decode_base_seeds, route_base_seed
 
 HIDDEN, LAYERS, ROWS = 8, 4, 6
 CPU = torch.device("cpu")

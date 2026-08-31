@@ -18,16 +18,15 @@ Policy (ported from the 0.20 in-tree branch, ``vllm/poc/mixed_decode.py``):
 
 from typing import TYPE_CHECKING
 
-from gonka_poc.mixed.policy import poc_cfg
-from gonka_poc.mixed.runtime import (
+from gonka_poc.mixed.policy import (
     POC_DEFER_LIMIT,
     decode_only_mixing_gate,
     poc_alloc_footprint,
-    poc_kv_capacity,
+    poc_cfg,
     poc_share_budget,
     poc_step_num_tokens,
-    resolve_poc_max_batch_size,
 )
+from gonka_poc.mixed.runtime import poc_kv_capacity, resolve_poc_max_batch_size
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request

@@ -481,8 +481,7 @@ def execute_poc_forward(
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
 
     # Batched k-dim pick + Haar rotation
-    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size,
-                                  k_dim, device, prefill_vector=True)
+    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
     yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
 
