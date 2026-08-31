@@ -295,6 +295,32 @@ def setup_decode_poc(runner, poc_requests) -> bool:
 # core vLLM footprint minimal). Each takes the GPUModelRunner as `runner`.
 # ---------------------------------------------------------------------------
 
+def _cat_prev_k(states, where: str) -> "torch.Tensor":
+    """torch.cat of per-nonce prev_k, with the invariant stated explicitly.
+
+    ``prev_k_t`` is published by the PREFILL snap. A row can only reach the decode
+    path with it still None if its prefill output has not been processed yet —
+    ``num_computed_tokens`` is advanced at schedule time, so it reads >= seq_len
+    while the prefill forward is still in flight. The admission gate defers such
+    rows by one step (see mixed/admission.py skip()); this check is the second
+    line, so that a regression there surfaces as a named invariant violation
+    instead of a TypeError from inside torch.cat.
+
+    Substituting a placeholder here would be WORSE than failing: prev_k < 0 makes
+    the embedding wrapper fall back to the prefill embed, so the nonce would keep
+    running with a silently wrong decode input and produce a plausible but invalid
+    trajectory.
+    """
+    missing = [i for i, st in enumerate(states) if st.prev_k_t is None]
+    if missing:
+        raise RuntimeError(
+            f"PoC {where}: {len(missing)} of {len(states)} decode rows have no "
+            f"prev_k (prefill output not processed yet), rows {missing[:8]}. "
+            "The admission gate should have deferred them by one step — see "
+            "gonka_poc/mixed/admission.py::skip.")
+    return torch.cat([st.prev_k_t for st in states])
+
+
 def build_unified_mixed_batch_inputs(
     runner,
     scheduler_output: "SchedulerOutput",
@@ -503,7 +529,8 @@ def build_unified_mixed_batch_inputs(
         if chain.get("prev_key") == chain_key and chain.get("prev") is not None:
             prev_cat = chain["prev"]
         else:
-            prev_cat = torch.cat([j[0].prev_k_t for j in decode_embed_jobs])
+            prev_cat = _cat_prev_k([j[0] for j in decode_embed_jobs],
+                                   "decode-embed")
         chain["prev"] = None            # consumed; the snap below publishes the next
         chain["step_key"] = chain_key
         chain["step_base"], chain["step_prev"] = base_cat, prev_cat
@@ -675,7 +702,8 @@ def process_poc_outputs_from_hidden(
                     base_seeds, prev_k = _chain["step_base"], _chain["step_prev"]
                 else:
                     base_seeds = torch.cat([m['decode_state'].base_seeds for m in decode_metas])
-                    prev_k = torch.cat([m['decode_state'].prev_k_t for m in decode_metas])
+                    prev_k = _cat_prev_k([m['decode_state'] for m in decode_metas],
+                                         "snap")
                 steps = pinned_to_device([m['decode_step'] for m in decode_metas], torch.int64, device)
                 sph = random_pick_indices_gpu(base_seeds, prev_k, steps, H, SPHERE_DIM, device)
                 # snap_with_margin: argmax(NaN) is garbage -> non-finite rows return k=-1
