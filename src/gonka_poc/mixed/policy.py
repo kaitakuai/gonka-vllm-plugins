@@ -78,8 +78,7 @@ def poc_alloc_footprint(poc_params, num_new_tokens: int) -> int:
 # PoC knobs live in our fork's CacheConfig. On a stock vLLM those attributes do
 # not exist and the plugin must still run — that is the point of shipping it as a
 # plugin — so every read goes through poc_cfg() and falls back to the SAME value
-# the fork declares. The table is pinned against the fork's CacheConfig by a test;
-# if a default drifts, consensus-relevant behaviour (route window, seq_len,
+# the fork declares. If a default drifts, consensus-relevant behaviour (seq_len,
 # max_tokens) would silently differ between a fork deploy and a stock deploy.
 POC_CONFIG_DEFAULTS = {
     "poc_max_batch_size": 0,

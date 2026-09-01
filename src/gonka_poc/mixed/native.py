@@ -611,8 +611,6 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     them. Idempotent: skipped if already wrapped."""
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
-    # Push the broadcast MoE routing window into gpu_random once per worker, before any
-    # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
     # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
     # ahead of time and resolves parameters by qualified name, so re-parenting a
