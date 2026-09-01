@@ -19,10 +19,9 @@ import pytest
 
 from tests.gonka.live_conftest import BASE_URL, MODEL, require_server, stop_poc
 
-# Small profile: fast on any single GPU; route_window=256 matches the shipped
-# engine profile (on 256-expert MoEs it selects legacy full scatter).
+# Small profile: fast on any single GPU.
 POC_PARAMS = {"model": MODEL, "seq_len": 64, "k_dim": 12,
-              "max_tokens": 16, "route_window": 256}
+              "scheme": "decode", "max_tokens": 16}
 
 POC_BASE = {
     "block_hash": "TEST_BLOCK",
@@ -79,8 +78,8 @@ class TestDecodePoC:
             assert len(k_steps) == want_len, (nonce, len(k_steps))
             assert all(0 <= k < 16 for k in k_steps), (nonce, k_steps[:5])
         enc = r.json()["encoding"]
-        assert enc["route_window"] == POC_PARAMS["route_window"]
-        assert enc["max_tokens"] == POC_PARAMS["max_tokens"]
+        assert enc["k_dim"] == POC_PARAMS["k_dim"]
+        assert (enc["dtype"], enc["endian"]) == ("f16", "le")
 
     def test_02_self_validation_zero_mismatch(self):
         """Teacher-forcing our own trajectories must give 0 mismatches
