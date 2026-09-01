@@ -47,6 +47,28 @@ def _server_gpu() -> str:
 
 
 
+def _rolling_window(total_nonces: int) -> int:
+    """Размер окна скользящей подачи; 0 = выключено (банкетная подача).
+
+    POC_ROLLING_WINDOW: >0 — явное окно; 0/пусто — выключено; "auto" — половина
+    измеренной стены не известна плагину, поэтому auto берёт консервативные 256:
+    заведомо ниже любой измеренной стены decode-PoC (592 на B300, 160 на H100 в
+    кампании D) и достаточно, чтобы держать движок сытым — лестницы показывают
+    насыщение к 256-512.
+    """
+    raw = os.environ.get("POC_ROLLING_WINDOW", "").strip().lower()
+    if not raw or raw == "0":
+        return 0
+    if raw == "auto":
+        return min(256, max(1, total_nonces))
+    try:
+        w = int(raw)
+    except ValueError:
+        logger.warning("POC_ROLLING_WINDOW=%r не число и не auto — выключаю", raw)
+        return 0
+    return max(0, min(w, total_nonces))
+
+
 async def compute_nonce_artifacts(
     engine_client,
     nonces: List[int],
@@ -170,7 +192,28 @@ async def compute_nonce_artifacts(
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
         return None
 
-    results = await asyncio.gather(*[compute_one(n) for n in nonces])
+    # ── Скользящая подача (rolling admission) ─────────────────────────────
+    # Банкетная подача (все нонсы разом) упирается в стену: у стены пул занят
+    # лишь наполовину (пик префилла), но одновременная посадка всего батча
+    # требует резерва под худший случай и провоцирует гонку префилл/декод на
+    # больших батчах. Окно W ограничивает ОДНОВРЕМЕННОСТЬ, не размер заявки:
+    # новый нонс входит, когда прежний докрутил траекторию и освободил блоки —
+    # как чатовый поток. Артефакты побитово те же: изменяется только состав
+    # шага, который вердикт фильтрует через tau (см. кампанию D).
+    # POC_ROLLING_WINDOW=0 (умолчание) сохраняет прежнее поведение.
+    window = _rolling_window(len(nonces))
+    if window:
+        logger.info("PoC rolling admission: %d nonces through a window of %d",
+                    len(nonces), window)
+        sem = asyncio.Semaphore(window)
+
+        async def gated(n: int):
+            async with sem:
+                return await compute_one(n)
+
+        results = await asyncio.gather(*[gated(n) for n in nonces])
+    else:
+        results = await asyncio.gather(*[compute_one(n) for n in nonces])
     out = [r for r in results if r is not None]
     # Batch-level summary. A per-nonce warning can drown in a 500-nonce round;
     # this line states the shortfall once, in the terms an operator acts on.
