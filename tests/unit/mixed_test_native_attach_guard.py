@@ -41,7 +41,7 @@ def test_load_passes_every_required_argument(monkeypatch):
     seen = {}
 
     def fake_attach(model, layers, embed_owner, max_tokens, hidden_size,
-                    device, dtype, route_window=16):
+                    device, dtype, route_window=16, hf_config=None):
         seen.update(hidden_size=hidden_size, device=device, dtype=dtype,
                     max_tokens=max_tokens, route_window=route_window,
                     n_layers=len(layers))
