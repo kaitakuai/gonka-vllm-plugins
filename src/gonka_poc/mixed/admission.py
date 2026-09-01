@@ -28,9 +28,12 @@ from gonka_poc.mixed.policy import (
     poc_step_num_tokens,
 )
 from gonka_poc.mixed.runtime import poc_kv_capacity, resolve_poc_max_batch_size
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class PoCAdmission:
@@ -38,7 +41,11 @@ class PoCAdmission:
 
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
                  "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
-                 "_scheduler", "_prefill_landing")
+                 "_scheduler", "_prefill_landing", "_any_scheduled", "_stalled")
+
+    # Сколько шагов держать шаг за декодом после застрявшего префилла, прежде
+    # чем снова попробовать префилл (если ни одна строка не завершилась раньше).
+    STALL_RETRY_STEPS = 16
 
     def __init__(self, scheduler, token_budget: int) -> None:
         queues = (scheduler.running, scheduler.waiting)
@@ -85,6 +92,40 @@ class PoCAdmission:
             poc_cfg(cache_config, "poc_share"), token_budget, chat_present)
         self._scheduled = 0
         self._tokens = 0
+        self._any_scheduled = 0
+
+        # Живость (лайвлок на Hopper, 01.09.2026). Если прошлый шаг объявил
+        # префилл PoC, но не запланировал НИ ОДНОЙ строки — ожидающим не хватило
+        # KV, а декодные были удержаны ради uniform-step, — движок крутится
+        # вхолостую навсегда: память освобождает только декод, а декод ждёт
+        # префилла. Тогда шаг отдаётся декоду (ожидающие строки удерживаются,
+        # шаг остаётся однородным). Префилл пробуем снова, когда хоть одна
+        # строка завершилась (running уменьшился) или каждые STALL_RETRY_STEPS.
+        prev = getattr(scheduler, "_poc_admission", None)
+        stalled = False
+        if poc_will_prefill:
+            if (prev is not None and prev.active and prev._poc_prefill
+                    and prev._any_scheduled == 0):
+                if getattr(scheduler, "_poc_stall_running", None) is None:
+                    logger.info(
+                        "poc: stall — префилл PoC не влез в KV, шаг отдан "
+                        "декоду (running=%d, waiting=%d)",
+                        len(scheduler.running), len(scheduler.waiting))
+                scheduler._poc_stall_running = len(scheduler.running)
+                scheduler._poc_stall_steps = 0
+                stalled = True
+            elif getattr(scheduler, "_poc_stall_running", None) is not None:
+                steps = getattr(scheduler, "_poc_stall_steps", 0) + 1
+                if (len(scheduler.running) < scheduler._poc_stall_running
+                        or steps >= self.STALL_RETRY_STEPS):
+                    scheduler._poc_stall_running = None  # снова пробуем префилл
+                else:
+                    scheduler._poc_stall_steps = steps
+                    stalled = True
+        self._stalled = stalled
+        scheduler._poc_admission = self
+        if stalled:
+            poc_will_prefill = False
         # Отложенный первый шаг декода (возврат fafabbd). Префилл публикует
         # prev_k нонса, а num_computed_tokens продвигается в момент ПЛАНИРОВАНИЯ,
         # так что строка доходит до декода раньше, чем сел вывод префилла.
@@ -120,6 +161,10 @@ class PoCAdmission:
             return self._defer_chat
         if self._defer_poc or self._scheduled >= self._max_batch:
             return True
+        # Шаг отдан декоду после застрявшего префилла: ожидающие строки ждут,
+        # пока декод освободит KV (шаг остаётся однородным).
+        if self._stalled and request.num_computed_tokens == 0:
+            return True
         # Префилл этой строки сел в прошлом шаге — её вывод ещё в полёте.
         if getattr(request, "request_id", None) in self._prefill_landing:
             return True
@@ -149,7 +194,10 @@ class PoCAdmission:
         return poc_alloc_footprint(request.poc_params, num_new_tokens)
 
     def note_scheduled(self, request: "Request", num_new_tokens: int) -> None:
-        if not self.active or request.poc_params is None:
+        if not self.active:
+            return
+        self._any_scheduled += 1
+        if request.poc_params is None:
             return
         self._scheduled += 1
         self._tokens += num_new_tokens
