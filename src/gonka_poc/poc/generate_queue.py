@@ -16,6 +16,23 @@ from gonka_poc.poc.reservation import poc_reservation
 
 logger = logging.getLogger(__name__)
 
+# Decode-PoC request ids still inside the engine. /stop cancels the round's
+# task, but requests already admitted keep draining; a round started while they
+# drain shares a forward with them, and the different batch composition changes
+# every trajectory in it (measured: 0/8 agreement on the overlapping probe).
+_inflight: set = set()
+
+
+async def drain_poc(timeout: float = 30.0) -> int:
+    """Wait for in-flight PoC requests to finish. Returns how many were left."""
+    deadline = time.monotonic() + timeout
+    while _inflight and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    if _inflight:
+        logger.warning("PoC drain timed out with %d request(s) in flight",
+                       len(_inflight))
+    return len(_inflight)
+
 
 def _server_engine() -> dict:
     """Engine identity of the SERVING box: version/commit, attention backend,
@@ -109,6 +126,7 @@ async def compute_nonce_artifacts(
             per_nonce_reflection=per_nonce_reflection,
         )
         request_id = f"poc-{uuid.uuid4()}"
+        _inflight.add(request_id)
         # PoC emits its artifact ONCE (emit-once): a single finished output
         # carrying the full trajectory (decode) or vector (prefill).
         try:
@@ -145,6 +163,8 @@ async def compute_nonce_artifacts(
                 return artifact
         except Exception as e:
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
+        finally:
+            _inflight.discard(request_id)
         return None
 
     results = await asyncio.gather(*[compute_one(n) for n in nonces])
@@ -171,7 +191,6 @@ class GenerateJob:
     seq_len: int
     k_dim: int
     batch_size: int
-    route_window: int = 16  # MoE seeded-routing window used; recorded in artifact encoding
     poc_stronger_rng: bool = False
     poc_decode: bool = False
     max_tokens: int = 0
@@ -416,8 +435,7 @@ class GenerateQueue:
                 "status": "completed",
                 "request_id": job.request_id,
                 "artifacts": computed_artifacts,
-                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le",
-                             "route_window": job.route_window},
+                "encoding": {"dtype": "f16", "k_dim": job.k_dim, "endian": "le"},
                 "server_gpu": _server_gpu(),
             "server_engine": _server_engine(),
             }

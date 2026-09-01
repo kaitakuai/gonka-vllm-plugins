@@ -16,7 +16,7 @@ from gonka_poc.poc.data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMA
 from gonka_poc.poc.callbacks import CallbackSender
 from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
-    compute_nonce_artifacts,
+    compute_nonce_artifacts, drain_poc,
 )
 from gonka_poc.poc.reservation import poc_reservation
 from gonka_poc.poc.validation import run_validation
@@ -550,8 +550,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             seq_len=body.params.seq_len,
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
-            route_window=getattr(getattr(getattr(engine_client, "vllm_config", None),
-                                         "cache_config", None), "poc_route_window", 256),
             poc_stronger_rng=body.poc_stronger_rng,
             poc_decode=(body.params.scheme == "decode"),
             max_tokens=body.params.max_tokens,
@@ -635,10 +633,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "status": "completed",
             "request_id": str(uuid.uuid4()),
             "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le",
-                         "route_window": getattr(getattr(getattr(engine_client,
-                             "vllm_config", None), "cache_config", None),
-                             "poc_route_window", 256)},
+            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
             "server_gpu": _server_gpu(),
             "server_engine": _server_engine(),
         }
@@ -723,4 +718,8 @@ async def stop_round(request: Request) -> dict:
 
     await _cancel_poc_tasks(app_id)
     await clear_queue()
+    # Cancelling the task does not evict requests already inside the engine:
+    # a round started while they drain shares a forward with them and every
+    # trajectory in it comes out different. Report STOPPED only once idle.
+    await drain_poc()
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}
