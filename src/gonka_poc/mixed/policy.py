@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 """Pure mixing-policy functions, ported VERBATIM from Ilya Slavutin's in-tree
 port (axeltec-software/vllm @ poc-decode-0.25, vllm/poc/mixed_decode.py).
@@ -13,6 +14,14 @@ def poc_is_pure_path(poc_params) -> bool:
     """True for prefill-only PoC (max_tokens == 0), which has no decode loop. All
     decode — generation and validation — runs step-driven. Pure (unit-testable)."""
     return poc_params.max_tokens == 0
+
+
+def poc_chat_like() -> bool:
+    """POC_CHAT_LIKE=1: PoC живёт как чат — префилл и декод PoC-строк делят один
+    шаг, чужие префиллы не изолируются, посадка по одному нонсу. Цена — шаги с
+    префиллом не ложатся на захваченный CUDA-граф (как и у чата). Для V4 на 0.28
+    vLLM и так принудительно ставит CompilationMode.NONE с разбиваемыми графами."""
+    return os.environ.get("POC_CHAT_LIKE", "").strip() in ("1", "true", "yes")
 
 
 def decode_only_mixing_gate(

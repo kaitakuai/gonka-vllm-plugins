@@ -76,6 +76,10 @@ def _rolling_wave(window: int) -> int:
     raw = os.environ.get("POC_ROLLING_WAVE", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return min(int(raw), window)
+    # Как чат: посадка по одному нонсу — uniform-step снят, префилл в каждом
+    # шаге декод не останавливает.
+    if os.environ.get("POC_CHAT_LIKE", "").strip() in ("1", "true", "yes"):
+        return 1
     return max(16, min(window, window // 4))
 
 

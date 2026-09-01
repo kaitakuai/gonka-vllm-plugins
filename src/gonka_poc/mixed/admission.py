@@ -24,6 +24,7 @@ from gonka_poc.mixed.policy import (
     poc_alloc_footprint,
     poc_cfg,
     poc_share_budget,
+    poc_chat_like,
     poc_step_num_tokens,
 )
 from gonka_poc.mixed.runtime import poc_kv_capacity, resolve_poc_max_batch_size
@@ -101,7 +102,8 @@ class PoCAdmission:
         self._poc_prefill = poc_will_prefill
         self._defer_chat, self._defer_poc, scheduler._poc_defers = (
             decode_only_mixing_gate(
-                mixed_cudagraph=True,
+                # Как чат: без изоляции префиллов (исходное поведение гейта).
+                mixed_cudagraph=not poc_chat_like(),
                 poc_decode_pending=poc_decode_pending,
                 poc_will_prefill=poc_will_prefill,
                 chat_will_prefill=chat_will_prefill,
@@ -121,6 +123,10 @@ class PoCAdmission:
         # Префилл этой строки сел в прошлом шаге — её вывод ещё в полёте.
         if getattr(request, "request_id", None) in self._prefill_landing:
             return True
+        # Как чат: префилл и декод PoC-строк делят шаг. Иначе — uniform-step
+        # (чисто декодный шаг ложится на захваченный CUDA-граф).
+        if poc_chat_like():
+            return False
         # Keep a step uniform: never mix a PoC prefill with PoC decode rows.
         return self._poc_prefill and request.num_computed_tokens > 0
 
