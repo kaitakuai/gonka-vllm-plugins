@@ -648,6 +648,19 @@ class PoCNativeState:
 _TOKEN_ID_ROUTED_MODELS = ("deepseek_v4",)
 
 
+_ABLATE = frozenset(x.strip() for x in os.environ.get("POC_ABLATE", "").lower().split(",") if x.strip())
+
+
+def _ablated(part: str) -> bool:
+    """POC_ABLATE=reflect,router,pseudo — ДИАГНОСТИКА: отключить вмешательство
+    PoC, чтобы найти дефект (зависание >~200 PoC-строк на Hopper). Ломает
+    консенсус — корпуса в этом режиме для вердиктов НЕПРИГОДНЫ.
+      reflect — отражения Хаусхолдера на слоях (PoCLayerWrapper не ставится);
+      router  — сидирование экспертов (PoCRouterWrapper не ставится);
+      pseudo  — псевдо-номера токенов на hash-MoE (dummy ids как раньше)."""
+    return part in _ABLATE
+
+
 def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: int,
                       hidden_size: int, device, dtype,
                       route_window: int = 16,
@@ -661,7 +674,8 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
     set_route_window(route_window)
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
-    if getattr(hf_config, "model_type", None) in _TOKEN_ID_ROUTED_MODELS:
+    if (getattr(hf_config, "model_type", None) in _TOKEN_ID_ROUTED_MODELS
+            and not _ablated("pseudo")):
         state.token_id_vocab = int(hf_config.vocab_size)
         logger.info("PoC pseudo token ids ON (model_type=%s, vocab=%d): "
                     "hash-MoE layers route by token id",
@@ -669,7 +683,9 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
     # ahead of time and resolves parameters by qualified name, so re-parenting a
     # layer under a wrapper breaks the compiled graph's parameter map.
-    for i, layer in enumerate(layers):
+    if _ablated("reflect"):
+        logger.warning("POC_ABLATE=reflect: отражения Хаусхолдера ОТКЛЮЧЕНЫ — диагностика, не консенсус")
+    for i, layer in enumerate(layers if not _ablated("reflect") else []):
         _install_poc_patch(
             layer, PoCLayerWrapper(layer, state.vectors[i], state.mask))
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
@@ -724,6 +740,9 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         state._route_base.append(route_base)
         state.router_meta.append((n_exp, top_k))
         _gate = moe.gate
+        if _ablated("router"):
+            skipped_hash += 0  # сидирование ОТКЛЮЧЕНО (POC_ABLATE=router)
+            continue
         _install_poc_patch(_gate, PoCRouterWrapper(
             _gate, route_base, state.route_step, n_exp, top_k, state.mask))
         # The gate-logit forcing above is the single routing seam, as in
