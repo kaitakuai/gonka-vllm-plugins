@@ -240,8 +240,13 @@ def _experts_meta(experts) -> tuple:
     n_group=topk_group=1 (the grouped formula degenerates away). A
     gate+experts module we cannot read is a HARD error — a silently unseeded
     router re-opens the MoE honest-floor hole."""
-    if hasattr(experts, "top_k"):
+    if hasattr(experts, "top_k") and hasattr(experts, "global_num_experts"):
         return int(experts.global_num_experts), int(experts.top_k)
+    # DeepSeek V4 MegaMoE (deep_gemm_mega_moe) names the global count
+    # ``num_experts``; ``num_local_experts`` is the EP shard, not what the
+    # router scores over.
+    if hasattr(experts, "top_k") and hasattr(experts, "num_experts"):
+        return int(experts.num_experts), int(experts.top_k)
     cfg = getattr(experts, "moe_config", None)
     if cfg is not None:
         return int(cfg.num_experts), int(cfg.experts_per_token)
