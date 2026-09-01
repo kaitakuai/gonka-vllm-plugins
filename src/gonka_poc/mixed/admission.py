@@ -36,7 +36,8 @@ class PoCAdmission:
     """Decides which PoC/chat requests may enter the current forward."""
 
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
-                 "_token_budget", "_scheduled", "_tokens", "_poc_prefill")
+                 "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
+                 "_scheduler", "_prefill_landing")
 
     def __init__(self, scheduler, token_budget: int) -> None:
         queues = (scheduler.running, scheduler.waiting)
@@ -83,6 +84,16 @@ class PoCAdmission:
             poc_cfg(cache_config, "poc_share"), token_budget, chat_present)
         self._scheduled = 0
         self._tokens = 0
+        # Отложенный первый шаг декода (возврат fafabbd). Префилл публикует
+        # prev_k нонса, а num_computed_tokens продвигается в момент ПЛАНИРОВАНИЯ,
+        # так что строка доходит до декода раньше, чем сел вывод префилла.
+        # Асинхронный планировщик держит очередь глубины 1: вывод шага N
+        # обработан к шагу N+2. Задержка ровно на один шаг закрывает гонку.
+        # При скользящей подаче стык префилл->декод случается на каждой волне,
+        # поэтому страховка обязательна, а не «ради редкого случая».
+        self._scheduler = scheduler
+        self._prefill_landing = getattr(scheduler, "_poc_prefill_landing", None) or set()
+        scheduler._poc_prefill_landing = set()
 
         # Vestigial in the 0.20 branch (hardcoded False): PoC never demands an
         # exclusive pure-decode step, so chat+PoC decode freely share a forward.
@@ -106,6 +117,9 @@ class PoCAdmission:
         if request.poc_params is None:
             return self._defer_chat
         if self._defer_poc or self._scheduled >= self._max_batch:
+            return True
+        # Префилл этой строки сел в прошлом шаге — её вывод ещё в полёте.
+        if getattr(request, "request_id", None) in self._prefill_landing:
             return True
         # Keep a step uniform: never mix a PoC prefill with PoC decode rows.
         return self._poc_prefill and request.num_computed_tokens > 0
@@ -133,3 +147,11 @@ class PoCAdmission:
             return
         self._scheduled += 1
         self._tokens += num_new_tokens
+        # Строки, чей префилл ЗАВЕРШАЕТСЯ в этом шаге: их вывод сядет только
+        # после планирования следующего, skip() удержит их декод на один шаг.
+        seq_len = getattr(request.poc_params, "seq_len", None)
+        rid = getattr(request, "request_id", None)
+        done = getattr(request, "num_computed_tokens", None)
+        if seq_len and rid is not None and done is not None \
+                and done < seq_len <= done + num_new_tokens:
+            self._scheduler._poc_prefill_landing.add(rid)

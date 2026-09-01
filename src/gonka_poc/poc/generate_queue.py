@@ -69,6 +69,51 @@ def _rolling_window(total_nonces: int) -> int:
     return max(0, min(w, total_nonces))
 
 
+def _rolling_wave(window: int) -> int:
+    """Размер волны посадки: POC_ROLLING_WAVE или четверть окна (не меньше 16).
+    Меньше волна — ровнее поток, но чаще префилл-шаги, тормозящие декод;
+    больше — ближе к банкету."""
+    raw = os.environ.get("POC_ROLLING_WAVE", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return min(int(raw), window)
+    return max(16, min(window, window // 4))
+
+
+async def _run_in_waves(compute_one, nonces, window: int, wave: int):
+    """Первые `window` нонсов стартуют разом; далее, накопив `wave` освободившихся
+    мест (или когда в работе никого не осталось), сажает следующую волну целиком.
+    Возвращает результаты в порядке исходного списка."""
+    results = [None] * len(nonces)
+    pending = list(range(len(nonces)))
+    running = {}                      # task -> index
+    freed = 0
+
+    def launch(k: int):
+        nonlocal pending
+        batch, pending = pending[:k], pending[k:]
+        for idx in batch:
+            running[asyncio.ensure_future(compute_one(nonces[idx]))] = idx
+        if batch:
+            logger.info("PoC rolling admission: wave of %d (in flight %d, left %d)",
+                        len(batch), len(running), len(pending))
+
+    launch(window)
+    while running:
+        done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            idx = running.pop(t)
+            try:
+                results[idx] = t.result()
+            except Exception as e:   # compute_one сам ловит; это страховка
+                logger.error("PoC rolling: nonce %s raised %r", nonces[idx], e)
+                results[idx] = None
+            freed += 1
+        if pending and (freed >= wave or not running):
+            launch(min(freed, len(pending)))
+            freed = 0
+    return results
+
+
 async def compute_nonce_artifacts(
     engine_client,
     nonces: List[int],
@@ -192,26 +237,23 @@ async def compute_nonce_artifacts(
             logger.error("Error computing nonce %s: %r", nonce, e, exc_info=True)
         return None
 
-    # ── Скользящая подача (rolling admission) ─────────────────────────────
-    # Банкетная подача (все нонсы разом) упирается в стену: у стены пул занят
-    # лишь наполовину (пик префилла), но одновременная посадка всего батча
-    # требует резерва под худший случай и провоцирует гонку префилл/декод на
-    # больших батчах. Окно W ограничивает ОДНОВРЕМЕННОСТЬ, не размер заявки:
-    # новый нонс входит, когда прежний докрутил траекторию и освободил блоки —
-    # как чатовый поток. Артефакты побитово те же: изменяется только состав
-    # шага, который вердикт фильтрует через tau (см. кампанию D).
+    # ── Скользящая подача ВОЛНАМИ ─────────────────────────────────────────
+    # Посемафорная подача (по одному нонсу на освободившееся место) провалилась:
+    # правило uniform-step в admission.skip() пропускает ВСЕ декодные строки в
+    # шаге, где есть чей-то префилл, а при посадке по одному префилл есть в
+    # каждом шаге -> декод голодает, таймаут режет траектории (B300, 21:21:
+    # 324 пустых из 512 при окне 512). Волна сажает Q нонсов разом: один
+    # префилл-шаг на волну, между волнами декод идёт без помех — как банкет,
+    # только банкетов много и они перекрываются по времени.
+    # Окно W ограничивает одновременность, а не размер заявки; перелёт «принял
+    # больше, чем докрутит» исключён по построению.
     # POC_ROLLING_WINDOW=0 (умолчание) сохраняет прежнее поведение.
     window = _rolling_window(len(nonces))
-    if window:
-        logger.info("PoC rolling admission: %d nonces through a window of %d",
-                    len(nonces), window)
-        sem = asyncio.Semaphore(window)
-
-        async def gated(n: int):
-            async with sem:
-                return await compute_one(n)
-
-        results = await asyncio.gather(*[gated(n) for n in nonces])
+    if window and len(nonces) > window:
+        wave = _rolling_wave(window)
+        logger.info("PoC rolling admission: %d nonces, window %d, wave %d",
+                    len(nonces), window, wave)
+        results = await _run_in_waves(compute_one, list(nonces), window, wave)
     else:
         results = await asyncio.gather(*[compute_one(n) for n in nonces])
     out = [r for r in results if r is not None]
