@@ -86,7 +86,6 @@ POC_CONFIG_DEFAULTS = {
     "poc_seq_len": 256,
     "poc_max_tokens": 256,
     "poc_share": 0.5,
-    "poc_route_window": 256,
     "poc_vector_artifacts": False,
 }
 

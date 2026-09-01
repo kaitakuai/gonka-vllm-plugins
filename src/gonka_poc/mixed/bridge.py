@@ -76,7 +76,6 @@ class PoCRunnerBridge:
         self.native = attach_native_poc(
             model, layers, inner, runner.max_num_tokens,
             runner.model_config.get_hidden_size(), runner.device, runner.dtype,
-            route_window=poc_cfg(cfg, "poc_route_window"),
         )
         # mixed_decode reads the state off the runner (0.20 contract).
         runner._poc_native = self.native
