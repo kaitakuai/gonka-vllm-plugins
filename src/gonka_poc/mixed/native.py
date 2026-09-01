@@ -146,7 +146,8 @@ class PoCEmbeddingWrapper(nn.Module):
 
     def __init__(self, inner: nn.Module, embeds: torch.Tensor, mask: torch.Tensor,
                  embed_base: torch.Tensor = None, embed_prev_k: torch.Tensor = None,
-                 embed_step: torch.Tensor = None, hidden_size: int = 0):
+                 embed_step: torch.Tensor = None, hidden_size: int = 0,
+                 poc_token_ids: torch.Tensor = None):
         super().__init__()
         self.inner = inner
         self.hidden_size = hidden_size
@@ -154,6 +155,7 @@ class PoCEmbeddingWrapper(nn.Module):
         self.register_buffer("poc_mask", mask, persistent=False)
         # SYNTH = EMBEDDING (in-graph): synth the decode input from the chain buffers.
         self._synth = embed_base is not None
+        self.register_buffer("poc_token_ids", poc_token_ids, persistent=False)
         if self._synth:
             self.register_buffer("embed_base", embed_base, persistent=False)
             self.register_buffer("embed_prev_k", embed_prev_k, persistent=False)
@@ -167,8 +169,16 @@ class PoCEmbeddingWrapper(nn.Module):
         # Force masked (PoC) rows to a valid in-vocab id (0); their value is unused.
         n = input_ids.shape[0]
         m_rows = self.poc_mask[:n]
-        # On-device clamp (no host sync): masked rows -> 0, chat rows unchanged.
-        input_ids = torch.where(m_rows, torch.zeros_like(input_ids), input_ids)
+        # On-device substitution (no host sync): masked rows -> the PoC row's own
+        # id, chat rows unchanged. Historically this wrote a constant 0, which is
+        # all an embedding gather needs (the result is discarded below). But the
+        # id ALSO reaches the model's MoE layers, and DeepSeek-V4 routes its first
+        # num_hash_layers through tid2eid[input_ids]: a constant pins those layers
+        # to one expert set for every nonce and every step. poc_token_ids holds a
+        # seeded id per row when the architecture needs one, and stays all-zero
+        # otherwise -- so models that do not route by token id are unchanged.
+        input_ids = torch.where(m_rows, self.poc_token_ids[:n].to(input_ids.dtype),
+                                input_ids)
         out = self._inner_call(input_ids)
         m = m_rows.unsqueeze(-1)
         if not self._synth:
@@ -396,6 +406,12 @@ class PoCNativeState:
         self.embed_base = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.embed_prev_k = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self.embed_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        # Pseudo token ids for token-id-routed architectures (DeepSeek-V4 hash-MoE).
+        # vocab==0 means "this model does not route by token id" and the wrapper
+        # keeps the historical constant 0 -- so every other architecture, MiniMax
+        # included, is byte-identical to before this buffer existed.
+        self.token_id_vocab = 0
+        self.poc_token_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         # PoC-as-a-sampler, part 2: SNAP = SAMPLING. A wrapper on the final norm snaps
         # the last hidden -> sphere_k IN-GRAPH (reusing the embed_* seed buffers + the
         # codebook), writing per-row k/bad/margin/q here. The runner index_selects the
@@ -431,6 +447,21 @@ class PoCNativeState:
         self.embed_base.index_copy_(0, offs, base)
         self.embed_prev_k.index_copy_(0, offs, prev_k)
         self.embed_step.index_copy_(0, offs, step)
+        if self.token_id_vocab:
+            from gonka_poc.poc.decode_random import decode_pseudo_token_ids
+            self.poc_token_ids.index_copy_(
+                0, offs, decode_pseudo_token_ids(
+                    base, step, prev_k, self.token_id_vocab))
+
+    def set_prefill_token_ids(self, offs: torch.Tensor, ids: torch.Tensor) -> None:
+        """Publish pseudo token ids for the PREFILL rows of a decode-PoC nonce.
+
+        The prefill phase carries seq_len positions per nonce, so it is where most
+        of the tid2eid coverage comes from -- an order of magnitude more distinct
+        ids than the one-per-step decode path. No-op unless the architecture
+        routes by token id."""
+        if self.token_id_vocab:
+            self.poc_token_ids.index_copy_(0, offs, ids.to(torch.int32))
 
     # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
     # nonce), so a 128-nonce round is ~128 entries. Entries are stored in the
@@ -603,9 +634,19 @@ class PoCNativeState:
             self.mask[:n].copy_(row_mask)
 
 
+# Architectures whose MoE routes by TOKEN ID rather than by router logits, and
+# therefore need seeded pseudo ids instead of the constant the engine hands PoC
+# rows. Keyed by HF ``model_type``. Anything absent keeps ids at 0 and is
+# byte-identical to the behaviour before pseudo ids existed -- that is the
+# property that lets MiniMax goldens stay valid. The prefill scheme gates the
+# same way (see poc_model_runner._generate_poc_input_ids).
+_TOKEN_ID_ROUTED_MODELS = ("deepseek_v4",)
+
+
 def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: int,
                       hidden_size: int, device, dtype,
-                      route_window: int = 16) -> PoCNativeState:
+                      route_window: int = 16,
+                      hf_config=None) -> PoCNativeState:
     """Wrap each decoder layer (Householder) AND the token embedding (PoC-embed
     injection) BEFORE compilation, sharing one mask. Returns the state to drive
     them. Idempotent: skipped if already wrapped."""
@@ -615,6 +656,11 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
     set_route_window(route_window)
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
+    if getattr(hf_config, "model_type", None) in _TOKEN_ID_ROUTED_MODELS:
+        state.token_id_vocab = int(hf_config.vocab_size)
+        logger.info("PoC pseudo token ids ON (model_type=%s, vocab=%d): "
+                    "hash-MoE layers route by token id",
+                    hf_config.model_type, state.token_id_vocab)
     # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
     # ahead of time and resolves parameters by qualified name, so re-parenting a
     # layer under a wrapper breaks the compiled graph's parameter map.
@@ -628,7 +674,8 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         _emb = embed_owner.embed_tokens
         _wrap = PoCEmbeddingWrapper(
             _emb, state.embeds, state.mask,
-            state.embed_base, state.embed_prev_k, state.embed_step, hidden_size)
+            state.embed_base, state.embed_prev_k, state.embed_step, hidden_size,
+            state.poc_token_ids)
         _install_poc_patch(_emb, _wrap)
     # SNAP = SAMPLING: patch the final norm in place, same reason as above.
     if embed_owner is not None and hasattr(embed_owner, "norm"):
