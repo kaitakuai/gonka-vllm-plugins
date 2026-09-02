@@ -23,16 +23,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# MARGIN GATE (validator-side, mismatch-based). Count a teacher-forced disagreement as a
-# mismatch ONLY if the validator's own snap margin (top1-top2 cosine gap) >= tau. A tiny
-# margin means the query sat on a codebook boundary, where cross-HW/backend fp jitter flips
-# the snap — boundary jitter, NOT fraud; a structured fraud offset pushes the query
-# decisively into a wrong cell (larger margin) and still counts. Since margin >= 0 always,
-# tau=0.0 (default) is a no-op: every mismatch counts, artifacts and verdicts unchanged.
-# The prover is unaffected (it emits no margin); only the validator's count is gated. Pin
-# tau PER MODEL (calibrate so the honest cross-HW floor drops below the acceptance
-# threshold while the subtlest fraud of concern stays above it).
-_MARGIN_TAU = float(os.environ.get("VLLM_POC_MARGIN_TAU", "0") or "0")
+# SNAP MARGIN (validator-side). Every teacher-forced disagreement is counted, and the
+# largest snap margin (top1-top2 cosine gap of the validator's OWN query) among the
+# disagreeing steps is emitted as the nonce's distance. A tiny margin means the query
+# sat on a codebook boundary, where cross-HW/backend fp jitter flips the snap; a
+# structured fraud pushes the query decisively into a wrong cell. The threshold that
+# separates the two (tau) is NOT applied here: it arrives with the validation request
+# as stat_test.dist_threshold, exactly like the prefill L2 threshold, so a validator
+# cannot move its own floor through the environment.
 
 def _vector_artifact_cfg(runner) -> bool:
     """poc_vector_artifacts enabled? The dim is the PoC's own k_dim and the window
@@ -778,18 +776,22 @@ def process_poc_outputs_from_hidden(
                 _emit_t0 = _diag_now()
                 # End-of-sequence: ONE host copy of the trajectory + the DEFERRED
                 # reductions (emit-once). n_nan = non-finite steps (snap marks k=-1);
-                # mismatch = confident (margin>=tau) finite disagreements vs the reference
-                # over the whole k+margin trajectory — identical to the old per-step sum,
-                # just batched here so the hot loop stays counter-free.
+                # mismatch = finite disagreements vs the reference over the whole
+                # k trajectory, plus the largest margin among them — batched here so
+                # the hot loop stays counter-free.
                 k_traj = torch.cat(st.k_steps_t)              # [L] int64 on device
                 k_points = k_traj.tolist()
                 n_nan = int((k_traj == -1).sum().item())
+                mismatch_margin_max = 0.0
                 if st.reference_t is not None:
                     margin_traj = torch.cat(st.margin_steps_t)
                     L = min(k_traj.shape[0], st.reference_t.shape[0])
-                    n_mismatches = int((
-                        (k_traj[:L] != st.reference_t[:L]) & (k_traj[:L] >= 0)
-                        & (margin_traj[:L] >= _MARGIN_TAU)).sum().item())
+                    disagree = ((k_traj[:L] != st.reference_t[:L])
+                                & (k_traj[:L] >= 0))
+                    n_mismatches = int(disagree.sum().item())
+                    if n_mismatches:
+                        mismatch_margin_max = float(
+                            margin_traj[:L][disagree].max().item())
                 else:
                     n_mismatches = -1
                 if n_nan:
@@ -821,6 +823,7 @@ def process_poc_outputs_from_hidden(
                     n_sphere_mismatches=(
                         n_mismatches if st.reference is not None else -1),
                     n_nan_steps=n_nan,
+                    mismatch_margin_max=mismatch_margin_max,
                     sph_values_steps=sph_vals,
                 )
                 get_decode_manager(runner).free(meta['req_id'])

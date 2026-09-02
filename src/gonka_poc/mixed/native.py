@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 from gonka_poc.poc.gpu_random import (generate_householder_vector,
                                       _seed_from_string)
 from gonka_poc.poc.decode_random import (expert_logits_from_base, route_base_seed,
-                                         pinned_to_device, set_route_window)
+                                         pinned_to_device)
 
 # Debug-only TP guard (VLLM_POC_DEBUG_TP=1): PoC reflection vectors / embeds are
 # generated per rank from deterministic seeds and MUST be bit-identical across
@@ -676,16 +676,12 @@ def _ablated(part: str) -> bool:
 
 def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: int,
                       hidden_size: int, device, dtype,
-                      route_window: int = 16,
                       hf_config=None) -> PoCNativeState:
     """Wrap each decoder layer (Householder) AND the token embedding (PoC-embed
     injection) BEFORE compilation, sharing one mask. Returns the state to drive
     them. Idempotent: skipped if already wrapped."""
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
-    # Push the broadcast MoE routing window into gpu_random once per worker, before any
-    # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
-    set_route_window(route_window)
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
     # Слитое отражение компилируется при первом вызове; сделать это здесь, до
     # захвата CUDA-графов, чтобы JIT не попал внутрь захвата.

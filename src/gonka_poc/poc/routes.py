@@ -12,11 +12,14 @@ from pydantic import BaseModel, ConfigDict
 
 import logging
 from gonka_poc.poc.config import PoCState
-from gonka_poc.poc.data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from gonka_poc.poc.data import (
+    Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
+    DEFAULT_FRAUD_THRESHOLD,
+)
 from gonka_poc.poc.callbacks import CallbackSender
 from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
-    compute_nonce_artifacts,
+    compute_nonce_artifacts, drain_poc,
 )
 from gonka_poc.poc.reservation import poc_reservation
 from gonka_poc.poc.validation import run_validation
@@ -518,14 +521,32 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         validation_nonces = set(a.nonce for a in body.validation.artifacts)
         if validation_nonces != set(body.nonces):
             raise HTTPException(status_code=400, detail="validation.artifacts nonces must match nonces field")
-    
+
+    enforced_k_steps = body.enforced_k_steps
+    if (body.validation and body.params.scheme == "decode"
+            and enforced_k_steps is None):
+        # The wire form carries the reference trajectory inside each artifact.
+        # Without teacher-forcing it, every computed artifact comes back with
+        # n_sphere_mismatches=-1 (nothing compared) and the verdict is vacuous.
+        missing = [a.nonce for a in body.validation.artifacts
+                   if not a.k_points_steps]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=("decode validation needs k_points_steps for every "
+                        f"artifact, missing for nonces {missing[:8]}"))
+        enforced_k_steps = {a.nonce: list(a.k_points_steps)
+                            for a in body.validation.artifacts}
+
     validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts} if body.validation else None
     # prover-side pre-snap slices (reference generated with debug or
     # poc_vector_artifacts):
     # lets run_validation attach the continuous vector-channel score as evidence.
     ref_vectors = {a.nonce: a.sph_values_steps for a in body.validation.artifacts
                    if a.sph_values_steps} if body.validation else None
-    stat_test = body.stat_test or StatTestModel()
+    stat_test = body.stat_test or StatTestModel(
+        dist_threshold=(DEFAULT_MARGIN_TAU if body.params.scheme == "decode"
+                        else DEFAULT_DIST_THRESHOLD))
     
     if not body.wait:
         queue = get_queue()
@@ -550,12 +571,10 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             seq_len=body.params.seq_len,
             k_dim=body.params.k_dim,
             batch_size=body.batch_size,
-            route_window=getattr(getattr(getattr(engine_client, "vllm_config", None),
-                                         "cache_config", None), "poc_route_window", 256),
             poc_stronger_rng=body.poc_stronger_rng,
             poc_decode=(body.params.scheme == "decode"),
             max_tokens=body.params.max_tokens,
-            enforced_k_steps=body.enforced_k_steps,
+            enforced_k_steps=enforced_k_steps,
             debug=body.debug,
             per_nonce_reflection=body.per_nonce_reflection,
             validation_artifacts=validation_map,
@@ -604,9 +623,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 await asyncio.sleep(0.1)
 
             chunk_inference_steps = None
-            if body.enforced_k_steps:
-                chunk_inference_steps = {n: body.enforced_k_steps[n]
-                                         for n in chunk if n in body.enforced_k_steps}
+            if enforced_k_steps:
+                chunk_inference_steps = {n: enforced_k_steps[n]
+                                         for n in chunk if n in enforced_k_steps}
 
             try:
                 artifacts = await _compute_artifacts_chunk(
@@ -635,27 +654,39 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             "status": "completed",
             "request_id": str(uuid.uuid4()),
             "artifacts": computed_artifacts,
-            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le",
-                         "route_window": getattr(getattr(getattr(engine_client,
-                             "vllm_config", None), "cache_config", None),
-                             "poc_route_window", 256)},
+            "encoding": {"dtype": "f16", "k_dim": body.params.k_dim, "endian": "le"},
             "server_gpu": _server_gpu(),
             "server_engine": _server_engine(),
         }
     
-    validation_result = run_validation(
-        computed_artifacts=computed_artifacts,
-        validation_map=validation_map,
-        n_total=len(body.nonces),
-        dist_threshold=stat_test.dist_threshold,
-        p_mismatch=stat_test.p_mismatch,
-        fraud_threshold=stat_test.fraud_threshold,
-        k_dim=body.params.k_dim,
-        # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
-        # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
-        use_trajectory=body.params.max_tokens > 0,
-        ref_vectors=ref_vectors,
-    )
+    if len(computed_artifacts) != len(body.nonces):
+        # A verdict is only meaningful over the full requested nonce set. Missing
+        # artifacts (dead engine, timeout) are NOT evidence of honesty: the
+        # mismatch counters simply never see those nonces, so the rate collapses
+        # toward zero and a broken validator would clear everyone it fails on.
+        raise HTTPException(
+            status_code=503,
+            detail=(f"validation aborted: {len(computed_artifacts)} of "
+                    f"{len(body.nonces)} nonces produced an artifact"))
+
+    try:
+        validation_result = run_validation(
+            computed_artifacts=computed_artifacts,
+            validation_map=validation_map,
+            n_total=len(body.nonces),
+            dist_threshold=stat_test.dist_threshold,
+            p_mismatch=stat_test.p_mismatch,
+            fraud_threshold=stat_test.fraud_threshold,
+            k_dim=body.params.k_dim,
+            # decode flow (max_tokens>0) → per-nonce snap margin vs dist_threshold
+            # (tau); prefill flow → vector-L2 vs dist_threshold. Same binomial,
+            # same response shape.
+            use_trajectory=body.params.max_tokens > 0,
+            ref_vectors=ref_vectors,
+        )
+    except ValueError as e:
+        # No comparison happened for some artifact: not a verdict.
+        raise HTTPException(status_code=503, detail=f"validation aborted: {e}")
 
     return {
         "status": "completed",
@@ -723,4 +754,8 @@ async def stop_round(request: Request) -> dict:
 
     await _cancel_poc_tasks(app_id)
     await clear_queue()
+    # Cancelling the task does not evict requests already inside the engine:
+    # a round started while they drain shares a forward with them and every
+    # trajectory in it comes out different. Report STOPPED only once idle.
+    await drain_poc()
     return {"status": "OK", "pow_status": {"status": "STOPPED"}}

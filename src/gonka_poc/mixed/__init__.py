@@ -2,8 +2,7 @@
 """Mixed-PoC (chat + PoC in one forward) — EXPERIMENTAL subpackage.
 
 Off unless explicitly enabled at launch. Depends one-way on the gonka_poc
-core (core never imports gonka_poc.mixed — pinned by
-tests/unit/test_mixed_contract.py).
+core: the core never imports gonka_poc.mixed.
 
 The engine calls into this package directly from the residual seams: the
 scheduler constructs ``PoCAdmission`` per step, and the model runner drives

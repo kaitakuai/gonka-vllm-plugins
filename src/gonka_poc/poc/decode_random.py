@@ -20,7 +20,6 @@ from gonka_poc.poc.gpu_random import (
 
 logger = logging.getLogger(__name__)
 
-_ROUTE_WINDOW = 0  # retired: the contiguous-run pick has no window
 _SALT_DECODE_EMBED = 0x0D
 _SALT_DECODE_PICK = 0x91
 # Token ids for architectures that route by token id (DeepSeek-V4 hash-MoE reads
@@ -29,12 +28,6 @@ _SALT_DECODE_PICK = 0x91
 _SALT_DECODE_TOKEN_ID = 0x57
 _MIX_A = 0x9E3779B1  # golden-ratio odd constant
 _MIX_B = 0x85EBCA77
-
-def set_route_window(n: int) -> None:
-    """Deprecated no-op: the windowed pick is retired (contiguous-run
-    formula). Kept so existing config plumbing does not break."""
-    if int(n) not in (0, 256):
-        logger.warning("poc_route_window=%d ignored: windowed pick retired", n)
 
 
 def pinned_to_device(vals, dtype, device):

@@ -4,25 +4,29 @@ Requires a running vLLM server on port 18199.
 
 Tests:
   1. /generate wait=true returns k-trajectories (max_tokens+1 snaps per nonce)
-  2. Self-validation: teacher-forcing our own trajectories -> 0 mismatches
+  2. Wire-form self-validation (validation.artifacts[].k_points_steps) is honest
   3. Different block_hash -> different k-trajectories
   4. Batch generation covers every requested nonce exactly once
-  5. Server-side validation via validation.artifacts[].k_points_steps
+  5. A tampered reference is fraud: the nonce-level margin test catches it
   6. max_tokens=0 degenerates to a single prefill snap through the same loop
+  7. A validation request without a reference trajectory is refused
 
-Bit-exactness note: 0-mismatch self-validation holds WITHIN one server
-process (strict determinism); across processes/nodes only the margin gate
-(tau) is meaningful — see NOTES.md of the migration bundle.
+The verdict is the prefill binomial over nonces; a nonce mismatches when the
+validator disagreed on a step with snap margin above stat_test.dist_threshold
+(tau). Boundary flips on non-deterministic hardware sit below tau, so an honest
+reference is not required to give 0 raw disagreements — only no fraud verdict.
 """
 import httpx
 import pytest
 
 from tests.gonka.live_conftest import BASE_URL, MODEL, require_server, stop_poc
 
-# Small profile: fast on any single GPU; route_window=256 matches the shipped
-# engine profile (on 256-expert MoEs it selects legacy full scatter).
+# Small profile: fast on any single GPU.
 POC_PARAMS = {"model": MODEL, "seq_len": 64, "k_dim": 12,
-              "max_tokens": 16, "route_window": 256}
+              "scheme": "decode", "max_tokens": 16}
+
+# The chain's stat_test for a decode model: tau as dist_threshold.
+STAT_TEST = {"dist_threshold": 0.025, "p_mismatch": 0.1, "fraud_threshold": 0.05}
 
 POC_BASE = {
     "block_hash": "TEST_BLOCK",
@@ -43,7 +47,7 @@ def server_ready():
 
 def poc_generate(nonces, block_hash="TEST_BLOCK", wait=True, batch_size=4,
                  validation=None, enforced_k_steps=None, params=None,
-                 timeout=300):
+                 stat_test=None, timeout=300):
     body = {
         **POC_BASE,
         "block_hash": block_hash,
@@ -56,6 +60,8 @@ def poc_generate(nonces, block_hash="TEST_BLOCK", wait=True, batch_size=4,
         body["validation"] = validation
     if enforced_k_steps is not None:
         body["enforced_k_steps"] = enforced_k_steps
+    if stat_test is not None:
+        body["stat_test"] = stat_test
     return httpx.post(
         f"{BASE_URL}/api/v1/pow/generate", json=body, timeout=timeout
     )
@@ -64,6 +70,12 @@ def poc_generate(nonces, block_hash="TEST_BLOCK", wait=True, batch_size=4,
 def _trajectories(response):
     arts = response.json()["artifacts"]
     return {a["nonce"]: a["k_points_steps"] for a in arts}
+
+
+def _validation(traj):
+    """The wire form the validator receives: one artifact per nonce."""
+    return {"artifacts": [{"nonce": n, "vector_b64": "", "k_points_steps": t}
+                          for n, t in traj.items()]}
 
 
 class TestDecodePoC:
@@ -79,23 +91,25 @@ class TestDecodePoC:
             assert len(k_steps) == want_len, (nonce, len(k_steps))
             assert all(0 <= k < 16 for k in k_steps), (nonce, k_steps[:5])
         enc = r.json()["encoding"]
-        assert enc["route_window"] == POC_PARAMS["route_window"]
-        assert enc["max_tokens"] == POC_PARAMS["max_tokens"]
+        assert enc["k_dim"] == POC_PARAMS["k_dim"]
+        assert (enc["dtype"], enc["endian"]) == ("f16", "le")
 
-    def test_02_self_validation_zero_mismatch(self):
-        """Teacher-forcing our own trajectories must give 0 mismatches
-        (strict in-process determinism)."""
+    def test_02_self_validation_honest(self):
+        """Wire-form validation of our own trajectories is not fraud, and the
+        verdict carries one trial per nonce like the prefill flow."""
         gen = poc_generate(nonces=[0, 1, 2, 3])
         assert gen.status_code == 200
         traj = _trajectories(gen)
-        val = poc_generate(
-            nonces=[0, 1, 2, 3],
-            enforced_k_steps={str(n): t for n, t in traj.items()})
+        val = poc_generate(nonces=[0, 1, 2, 3], validation=_validation(traj),
+                           stat_test=STAT_TEST)
         assert val.status_code == 200, val.text
         data = val.json()
-        assert data["n_mismatch"] == 0, data
-        assert data["n_total"] == 4 * (POC_PARAMS["max_tokens"] + 1)
-        assert data["fraud_detected"] is False
+        assert data["n_total"] == 4
+        assert data["fraud_detected"] is False, data
+        assert len(data["per_nonce"]) == 4
+        for p in data["per_nonce"]:
+            assert p["n_steps"] == POC_PARAMS["max_tokens"] + 1, p
+            assert p["n_sphere_mismatches"] >= 0, p   # a reference was compared
 
     def test_03_different_block_hash_different_trajectories(self):
         r1 = poc_generate(nonces=[0])
@@ -110,22 +124,22 @@ class TestDecodePoC:
         traj = _trajectories(r)
         assert set(traj) == set(nonces)
 
-    def test_05_server_side_validation_via_artifacts(self):
-        """validation.artifacts[].k_points_steps is the wire form the
-        validator sends; it must be picked up as the teacher-forcing
-        reference."""
-        gen = poc_generate(nonces=[0, 1])
+    def test_05_tampered_reference_is_fraud(self):
+        """A reference with every third step moved to another cell must come
+        back as fraud on every nonce: the disagreement margins of a wrong cell
+        sit above tau, unlike boundary jitter."""
+        gen = poc_generate(nonces=[0, 1, 2, 3])
         assert gen.status_code == 200
         traj = _trajectories(gen)
-        val = poc_generate(
-            nonces=[0, 1],
-            validation={"artifacts": [
-                {"nonce": n, "vector_b64": "", "k_points_steps": t}
-                for n, t in traj.items()]})
+        tampered = {n: [(k + 1 + i % 3) % 16 if i % 3 == 0 else k
+                        for i, k in enumerate(t)]
+                    for n, t in traj.items()}
+        val = poc_generate(nonces=[0, 1, 2, 3], validation=_validation(tampered),
+                           stat_test=STAT_TEST)
         assert val.status_code == 200, val.text
         data = val.json()
-        assert data["n_mismatch"] == 0, data
-        assert data["fraud_detected"] is False
+        assert data["fraud_detected"] is True, data
+        assert data["n_mismatch"] == 4, data
 
     def test_06_prefill_only_degenerate(self):
         """max_tokens=0: one snap per nonce through the same decode loop."""
@@ -134,3 +148,10 @@ class TestDecodePoC:
         assert r.status_code == 200, r.text
         traj = _trajectories(r)
         assert all(len(t) == 1 for t in traj.values())
+
+    def test_07_validation_needs_reference(self):
+        """validation.artifacts without k_points_steps is refused, never
+        answered with a vacuous honest verdict."""
+        r = poc_generate(nonces=[0], validation={"artifacts": [
+            {"nonce": 0, "vector_b64": ""}]}, stat_test=STAT_TEST)
+        assert r.status_code == 400, r.text

@@ -13,7 +13,7 @@ logger = init_logger(__name__)
 # Per-step vector-divergence tolerance: a decode step "diverged" if its pre-snap
 # cosine distance exceeds this. Honest cross-HW jitter sits far below it and fraud
 # far above (pilot: ~60x gap), so the exact value is not sensitive — one knob, like
-# VLLM_POC_MARGIN_TAU for the discrete channel. Lets the report show the vector
+# stat_test.dist_threshold for the discrete channel. Lets the report show the vector
 # channel as a plain "% of steps diverged" rate, on the SAME scale as the k rate.
 VECTOR_STEP_TOL = float(os.environ.get("VLLM_POC_VECTOR_TOL", "0.01"))
 
@@ -161,35 +161,44 @@ def run_validation(
 
     - prefill (use_trajectory=False): vector-L2 per nonce + binomial fraud_test
       (uses p_mismatch + fraud_threshold). Unchanged.
-    - decode (use_trajectory=True, max_tokens>0): count sphere_k mismatches over
-      all steps; fraud when the mismatch rate exceeds p_mismatch (reused as the max
-      allowed fraction). No binomial; p_value carries the rate but the decision
-      ignores it.
+    - decode (use_trajectory=True, max_tokens>0): a nonce mismatches when the
+      validator disagreed with the reference on some step with a snap margin
+      above dist_threshold (tau); then the same binomial fraud_test over nonces.
     - ref_vectors (optional, decode): prover-side sph_values_steps per nonce.
       When both sides carry pre-snap slices, the continuous vector-channel score
       (score_vector_channel) is attached as ``vector_score`` EVIDENCE — the
       verdict stays k-based so the two channels can be A/B'd on the same run.
     """
-    per_nonce: List[Dict] = []   # per-nonce evidence: [{nonce, n_sphere_mismatches, n_steps}]
+    per_nonce: List[Dict] = []   # per-nonce evidence
     if use_trajectory:
+        # One nonce is one trial, exactly as in the prefill flow. The nonce's
+        # distance is the largest snap margin among the steps where the
+        # validator disagreed with the reference (0.0 when it agreed
+        # everywhere); dist_threshold is the margin below which a disagreement
+        # is boundary jitter rather than a different computation. The same
+        # binomial test then runs over nonces with p_mismatch/fraud_threshold.
         n_mismatch = 0
-        n_steps = 0
         mismatch_nonces = []
         for a in computed_artifacts:
             traj = a.get("k_points_steps") or []
             if not traj:
                 continue
-            m = a.get("n_sphere_mismatches", 0) or 0
-            if m < 0:  # -1 == generation (no reference); treat as no mismatch
-                m = 0
-            n_mismatch += m
-            n_steps += len(traj)
-            per_nonce.append({"nonce": a["nonce"], "n_sphere_mismatches": m, "n_steps": len(traj)})
-            if m > 0:
+            m = a.get("n_sphere_mismatches")
+            if m is None or m < 0:
+                # -1 == no reference was teacher-forced, so nothing was
+                # compared. Counting it as zero mismatches would clear any
+                # prover whose trajectory the validator never looked at.
+                raise ValueError(
+                    f"nonce {a['nonce']}: no reference trajectory was compared")
+            d = float(a.get("mismatch_margin_max") or 0.0)
+            flagged = m > 0 and d > dist_threshold
+            n_mismatch += int(flagged)
+            per_nonce.append({"nonce": a["nonce"], "n_sphere_mismatches": m,
+                              "n_steps": len(traj), "mismatch_margin_max": d,
+                              "mismatch": flagged})
+            if flagged:
                 mismatch_nonces.append(a["nonce"])
-        rate = (n_mismatch / n_steps) if n_steps else 0.0
-        fraud_detected = rate > p_mismatch   # decision; p_value not used
-        p_value = rate                       # kept for shape; ignored by the decision
+        p_value, fraud_detected = fraud_test(n_mismatch, n_total, p_mismatch, fraud_threshold)
     else:
         n_mismatch, mismatch_nonces = validate_artifacts(
             computed_artifacts, validation_map, dist_threshold, k_dim

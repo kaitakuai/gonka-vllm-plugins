@@ -11,6 +11,10 @@ from scipy.stats import binomtest
 DEFAULT_DIST_THRESHOLD = 0.02
 DEFAULT_P_MISMATCH = 0.001
 DEFAULT_FRAUD_THRESHOLD = 0.01
+# Decode: the snap margin above which a teacher-forced disagreement counts as a
+# different computation rather than boundary jitter. Sent by the chain as
+# stat_test.dist_threshold for decode models; this is only the fallback.
+DEFAULT_MARGIN_TAU = 0.025
 
 
 @dataclass
@@ -24,12 +28,6 @@ class Artifact:
     sph_values_steps: Optional[List[str]] = None
 
 
-@dataclass
-class Encoding:
-    """Metadata for vector encoding."""
-    dtype: str = "f16"
-    k_dim: int = 12
-    endian: str = "le"
 
 
 def encode_vector(vector: np.ndarray) -> str:
@@ -45,17 +43,6 @@ def decode_vector(b64: str) -> np.ndarray:
     return f16.astype(np.float32)
 
 
-def is_mismatch(
-    computed_vector: np.ndarray,
-    received_b64: str,
-    dist_threshold: float = DEFAULT_DIST_THRESHOLD,
-) -> bool:
-    """Check if vectors differ beyond threshold."""
-    received = decode_vector(received_b64)
-    if not np.all(np.isfinite(received)):
-        return True
-    distance = float(np.linalg.norm(computed_vector - received))
-    return distance > dist_threshold
 
 
 def fraud_test(
@@ -89,29 +76,3 @@ def fraud_test(
     fraud_detected = p_value < fraud_threshold
     return p_value, fraud_detected
 
-
-def compare_artifacts(
-    computed_vectors: List[np.ndarray],
-    received_artifacts: List[Artifact],
-    dist_threshold: float = DEFAULT_DIST_THRESHOLD,
-) -> Tuple[int, List[int]]:
-    """
-    Compare computed vectors against received artifacts.
-    
-    Args:
-        computed_vectors: List of computed FP32 vectors
-        received_artifacts: List of received Artifact objects
-        dist_threshold: L2 distance threshold for mismatch
-    
-    Returns:
-        (n_mismatch, mismatch_nonces)
-    """
-    n_mismatch = 0
-    mismatch_nonces = []
-    
-    for vec, artifact in zip(computed_vectors, received_artifacts):
-        if is_mismatch(vec, artifact.vector_b64, dist_threshold):
-            n_mismatch += 1
-            mismatch_nonces.append(artifact.nonce)
-    
-    return n_mismatch, mismatch_nonces
