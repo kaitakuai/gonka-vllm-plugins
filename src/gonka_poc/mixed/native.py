@@ -15,6 +15,8 @@ updated in-place each round/step, so replay reads the live values.
 import os
 
 import torch
+
+from gonka_poc.mixed import reflect_kernel as _reflect_kernel
 from torch import nn
 
 import logging
@@ -69,13 +71,24 @@ def _assert_replicated_across_tp(t: torch.Tensor, name: str) -> None:
                 "per-rank RNG non-determinism; PoC is not TP-safe in this setup")
 
 
-def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Masked Householder: rows where mask is True -> x - 2*(x·v)*v; else x.
+def _reflect_torch(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Masked Householder (эталон): rows where mask is True -> x - 2*(x·v)*v; else x.
     Per-row independent, static-shape (no data-dependent control flow) -> the
     compiled graph captures it; cudagraph replays it reading live v/mask."""
     dot = (x * v).sum(-1, keepdim=True)
     transformed = x - 2.0 * dot * v
     return torch.where(mask, transformed, x)
+
+
+def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Отражение на PoC-строках: слитое Triton-ядро (один проход по строке)
+    там, где оно доступно, иначе эталон из четырёх ядер. v: [n, *pad, hidden],
+    mask: [n, *pad, 1] — как подаёт PoCLayerWrapper._apply."""
+    if x.is_cuda and _reflect_kernel.fused_enabled():
+        n = x.shape[0]
+        return _reflect_kernel.reflect_fused(
+            x, v.reshape(n, -1), mask.reshape(n))
+    return _reflect_torch(x, v, mask)
 
 
 def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
@@ -674,6 +687,15 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # gate is wrapped / graph is captured (consensus-affecting; see CacheConfig).
     set_route_window(route_window)
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
+    # Слитое отражение компилируется при первом вызове; сделать это здесь, до
+    # захвата CUDA-графов, чтобы JIT не попал внутрь захвата.
+    try:
+        _fused = _reflect_kernel.warmup(hidden_size, device, dtype)
+    except Exception as e:  # noqa: BLE001 — откат на эталон, не падение
+        logger.warning("PoC fused reflect: прогрев не удался (%r), эталонный путь", e)
+        os.environ["POC_FUSED_REFLECT"] = "0"
+        _fused = False
+    logger.info("PoC reflect: %s", "слитое Triton-ядро" if _fused else "эталон (4 ядра)")
     if (getattr(hf_config, "model_type", None) in _TOKEN_ID_ROUTED_MODELS
             and not _ablated("pseudo")):
         state.token_id_vocab = int(hf_config.vocab_size)
