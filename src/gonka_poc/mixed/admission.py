@@ -36,12 +36,119 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _pool_diag(scheduler) -> str:
+    """Диагностика пула KV в момент застрявшего префилла (только для лога)."""
+    try:
+        km = scheduler.kv_cache_manager
+        pool = km.block_pool
+        free = pool.get_num_free_blocks()
+        total = getattr(pool, "num_gpu_blocks", None)
+        inflight = getattr(scheduler, "_inflight_prefills", ())
+        reserved = scheduler._inflight_prefill_reserved_blocks() \
+            if hasattr(scheduler, "_inflight_prefill_reserved_blocks") else -1
+        need = -1
+        wt = None
+        for r in scheduler.waiting:
+            if r.poc_params is not None:
+                need = scheduler._request_remaining_blocks(r)
+                wt = f"num_tokens={r.num_tokens} prompt={r.num_prompt_tokens}"
+                break
+        # группы KV: тип спецификации и размер блока
+        groups = []
+        for g in getattr(km.kv_cache_config, "kv_cache_groups", ()):
+            sp = g.kv_cache_spec
+            groups.append(f"{type(sp).__name__}(bs={getattr(sp, 'block_size', '?')},"
+                          f"layers={len(g.layer_names)},"
+                          f"win={getattr(sp, 'sliding_window', getattr(sp, 'attention_chunk_size', None))})")
+        # сколько блоков держат первые бегущие строки PoC и чата
+        held = []
+        seen = {"poc": 0, "chat": 0}
+        for r in scheduler.running:
+            kind = "poc" if r.poc_params is not None else "chat"
+            if seen[kind] >= 3:
+                continue
+            seen[kind] += 1
+            n = 0
+            for m in getattr(km.coordinator, "single_type_managers", ()):
+                n += len(m.req_to_blocks.get(r.request_id, ()))
+            held.append(f"{kind}:computed={r.num_computed_tokens},blocks={n}")
+        return (f"free={free} total={total} inflight={len(inflight)} "
+                f"reserved={reserved} need_first_waiting={need} [{wt}] "
+                f"watermark={getattr(km, 'watermark_blocks', None)} "
+                f"groups={' '.join(groups)} held={' '.join(held)}")
+    except Exception as e:  # noqa: BLE001 — диагностика не должна ронять шаг
+        return f"diag failed: {e!r}"
+
+
+def _install_alloc_diag(scheduler) -> None:
+    """POC_DIAG=1: логировать (не чаще раза в секунду) отказ allocate_slots
+    для PoC-строки с состоянием пула. Только диагностика."""
+    import os, time
+    if os.environ.get("POC_DIAG", "") != "1":
+        return
+    km = scheduler.kv_cache_manager
+    if getattr(km, "_poc_diag_wrapped", False):
+        return
+    orig = km.allocate_slots
+    state = {"t": 0.0}
+
+    def wrapped(request, num_new_tokens, *a, **kw):
+        out = orig(request, num_new_tokens, *a, **kw)
+        if out is None and getattr(request, "poc_params", None) is not None:
+            now = time.monotonic()
+            if now - state["t"] > 1.0:
+                state["t"] = now
+                logger.info("poc: alloc отказ (new_tokens=%d computed=%d reserved=%s "
+                            "running=%d waiting=%d; %s)", num_new_tokens,
+                            request.num_computed_tokens, kw.get("reserved_blocks"),
+                            len(scheduler.running), len(scheduler.waiting),
+                            _pool_diag(scheduler))
+        return out
+
+    km.allocate_slots = wrapped
+    km._poc_diag_wrapped = True
+
+
+def _step_timer(scheduler, kind: str, prev_sched: int = -1, running: int = 0) -> None:
+    """POC_DIAG=1: интервалы между вызовами schedule() (= шаги движка) по видам
+    шага; сводка в лог каждые 5 с. Только диагностика."""
+    import os, time
+    if os.environ.get("POC_DIAG", "") != "1":
+        return
+    now = time.monotonic()
+    st = getattr(scheduler, "_poc_step_stat", None)
+    if st is None:
+        st = scheduler._poc_step_stat = {"t": now, "t0": now, "d": {}}
+        return
+    d = st["d"].setdefault(kind, [])
+    d.append((now - st["t"]) * 1000.0)
+    st["t"] = now
+    comp = st.setdefault("comp", {})
+    key = f"{kind}:sched={prev_sched}/run={running}"
+    comp[key] = comp.get(key, 0) + 1
+    if now - st["t0"] >= 5.0:
+        parts = []
+        for k, v in st["d"].items():
+            v.sort()
+            n = len(v)
+            parts.append(f"{k}: n={n} mean={sum(v)/n:.1f} p50={v[n//2]:.1f} "
+                         f"p90={v[int(n*.9)]:.1f} p99={v[int(n*.99)]:.1f} max={v[-1]:.1f}")
+        comp = st.get("comp", {})
+        top = sorted(comp.items(), key=lambda kv: -kv[1])[:6]
+        logger.info("poc: шаги(мс) %s || состав(prev sched/running: n) %s",
+                    " | ".join(parts), " ".join(f"{k}:{v}" for k, v in top))
+        st["t0"] = now
+        st["d"] = {}
+        st["comp"] = {}
+
+
 class PoCAdmission:
     """Decides which PoC/chat requests may enter the current forward."""
 
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
                  "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
-                 "_scheduler", "_prefill_landing", "_any_scheduled", "_stalled")
+                 "_scheduler", "_prefill_landing", "_any_scheduled", "_stalled",
+                 "_new_prefills")
 
     # Сколько шагов держать шаг за декодом после застрявшего префилла, прежде
     # чем снова попробовать префилл (если ни одна строка не завершилась раньше).
@@ -72,27 +179,80 @@ class PoCAdmission:
                 continue
             break
         self.active = poc_present
+        _p0 = getattr(scheduler, "_poc_admission", None)
+        _step_timer(scheduler, "poc" if poc_present else "chat",
+                    getattr(_p0, "_scheduled", -1) if (_p0 is not None and _p0.active) else -1,
+                    len(scheduler.running))
         if not self.active:
             return
 
+        _install_alloc_diag(scheduler)
+        _prev = getattr(scheduler, "_poc_admission", None)
+        if (_prev is not None and _prev.active and poc_will_prefill
+                and _prev._new_prefills == 0):
+            import os, time
+            if os.environ.get("POC_DIAG", "") == "1":
+                _t = getattr(scheduler, "_poc_diag_t", 0.0)
+                if time.monotonic() - _t > 1.0:
+                    scheduler._poc_diag_t = time.monotonic()
+                    logger.info(
+                        "poc: диаг — ожидающие есть, префилл не взят: running=%d "
+                        "waiting=%d prev(defer_poc=%s defer_chat=%s scheduled=%d "
+                        "max_batch=%d tokens=%d budget=%d stalled=%s landing=%d "
+                        "poc_prefill=%s any=%d) free=%d",
+                        len(scheduler.running), len(scheduler.waiting),
+                        _prev._defer_poc, _prev._defer_chat, _prev._scheduled,
+                        _prev._max_batch, _prev._tokens, _prev._token_budget,
+                        _prev._stalled, len(_prev._prefill_landing),
+                        _prev._poc_prefill, _prev._any_scheduled,
+                        scheduler.kv_cache_manager.block_pool.get_num_free_blocks())
         cache_config = scheduler.cache_config
         # Resolve here, not at config init: num_gpu_blocks is only known once
         # the engine has profiled free memory and built the KV pool.
+        # Ёмкость пула по формуле num_gpu_blocks*block_size имеет смысл только
+        # для однородного KV. Под гибридным KV (DeepSeek V4: полное внимание +
+        # окна 128/8 с блоками 256/64/8/4) vLLM кладёт в cache_config.block_size
+        # блок самой мелкой группы, и формула занижает пул в десятки раз:
+        # на 4×H100 кап выходил 134 строки при бегущих 197, лишние строки
+        # голодали до конца кохорты (02.09.2026). Допуск по памяти и так
+        # держит full_sequence_must_fit у vLLM плюс защита от лайвлока ниже,
+        # поэтому под гибридом клэмп по KV не применяем.
+        kv_groups = getattr(getattr(getattr(scheduler, "kv_cache_manager", None),
+                                    "kv_cache_config", None), "kv_cache_groups", None)
+        hybrid_kv = kv_groups is not None and len(kv_groups) > 1
+        kv_capacity = 0 if hybrid_kv else poc_kv_capacity(
+            getattr(cache_config, "num_gpu_blocks", 0),
+            getattr(cache_config, "block_size", 0),
+            poc_cfg(cache_config, "poc_seq_len"),
+            poc_cfg(cache_config, "poc_max_tokens"),
+        )
         self._max_batch = resolve_poc_max_batch_size(
             poc_cfg(cache_config, "poc_max_batch_size"),
             scheduler.scheduler_config.max_num_seqs,
-            poc_kv_capacity(
-                getattr(cache_config, "num_gpu_blocks", 0),
-                getattr(cache_config, "block_size", 0),
-                poc_cfg(cache_config, "poc_seq_len"),
-                poc_cfg(cache_config, "poc_max_tokens"),
-            ),
+            kv_capacity,
         )
+        # Декодный шаг PoC должен ложиться на захваченный CUDA-граф: батч больше
+        # max_cudagraph_capture_size исполняется eager (на 4×H100: 600 строк —
+        # 133 мс/шаг против 71 мс у чата на 512 строках, 02.09.2026).
+        cg = getattr(getattr(getattr(scheduler, "vllm_config", None),
+                             "compilation_config", None),
+                     "max_cudagraph_capture_size", None)
+        if cg and not poc_cfg(cache_config, "poc_max_batch_size"):
+            self._max_batch = min(self._max_batch, int(cg))
+        if not getattr(scheduler, "_poc_max_batch_logged", False):
+            scheduler._poc_max_batch_logged = True
+            logger.info("poc: строк PoC на шаг не более %d (hybrid_kv=%s, "
+                        "kv_capacity=%d, cudagraph_max=%s, configured=%d, "
+                        "max_num_seqs=%d)",
+                        self._max_batch, hybrid_kv, kv_capacity, cg,
+                        poc_cfg(cache_config, "poc_max_batch_size"),
+                        scheduler.scheduler_config.max_num_seqs)
         self._token_budget = poc_share_budget(
             poc_cfg(cache_config, "poc_share"), token_budget, chat_present)
         self._scheduled = 0
         self._tokens = 0
         self._any_scheduled = 0
+        self._new_prefills = 0
 
         # Живость (лайвлок на Hopper, 01.09.2026). Если прошлый шаг объявил
         # префилл PoC, но не запланировал НИ ОДНОЙ строки — ожидающим не хватило
@@ -109,8 +269,9 @@ class PoCAdmission:
                 if getattr(scheduler, "_poc_stall_running", None) is None:
                     logger.info(
                         "poc: stall — префилл PoC не влез в KV, шаг отдан "
-                        "декоду (running=%d, waiting=%d)",
-                        len(scheduler.running), len(scheduler.waiting))
+                        "декоду (running=%d, waiting=%d; %s)",
+                        len(scheduler.running), len(scheduler.waiting),
+                        _pool_diag(scheduler))
                 scheduler._poc_stall_running = len(scheduler.running)
                 scheduler._poc_stall_steps = 0
                 stalled = True
@@ -200,6 +361,8 @@ class PoCAdmission:
         if request.poc_params is None:
             return
         self._scheduled += 1
+        if request.num_computed_tokens == 0:
+            self._new_prefills += 1
         self._tokens += num_new_tokens
         # Строки, чей префилл ЗАВЕРШАЕТСЯ в этом шаге: их вывод сядет только
         # после планирования следующего, skip() удержит их декод на один шаг.
