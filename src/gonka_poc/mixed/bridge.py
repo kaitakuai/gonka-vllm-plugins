@@ -43,6 +43,11 @@ class _PoCRequestView:
         self.num_computed_tokens = num_computed_tokens
 
 
+def _poc_diag() -> bool:
+    import os
+    return os.environ.get("POC_DIAG", "") == "1"
+
+
 class PoCRunnerBridge:
     def __init__(self, runner) -> None:
         self.runner = runner
@@ -111,7 +116,16 @@ class PoCRunnerBridge:
             (self._reqs[rid] for rid in poc_req_ids if rid in self._reqs),
             key=lambda req: req.poc_params.nonce,
         )
-        mixed_decode.setup_decode_poc(self.runner, poc_requests)
+        if _poc_diag():
+            import time
+            torch.cuda.synchronize(); _t0 = time.monotonic()
+            mixed_decode.setup_decode_poc(self.runner, poc_requests)
+            torch.cuda.synchronize(); _dt = (time.monotonic() - _t0) * 1000
+            if _dt > 30:
+                logger.info("poc: pre_step setup_decode_poc %.0f мс (rows=%d, new=%d)",
+                            _dt, len(poc_requests), len(scheduler_output.scheduled_new_reqs))
+        else:
+            mixed_decode.setup_decode_poc(self.runner, poc_requests)
         self._step = {
             "poc_req_ids": poc_req_ids,
             "poc_requests": poc_requests,
@@ -130,6 +144,11 @@ class PoCRunnerBridge:
             raise RuntimeError(
                 "PoC step scheduled without native transforms attached — "
                 "artifacts would not be the consensus computation")
+        _diag = _poc_diag()
+        if _diag:
+            import time
+            torch.cuda.synchronize()
+            _t0 = time.monotonic()
         embeds, _positions, mask, metadata = (
             mixed_decode.build_unified_mixed_batch_inputs(
                 self.runner, scheduler_output, None, None, positions,
@@ -165,8 +184,21 @@ class PoCRunnerBridge:
                             row_steps[r] = stp
                             if getattr(pp, "per_nonce_reflection", False):
                                 row_refl_nonces[r] = pp.nonce
+                if _diag:
+                    torch.cuda.synchronize(); _t1 = time.monotonic()
                 self.native.set_row_block_hashes(row_hashes, row_refl_nonces)
+                if _diag:
+                    torch.cuda.synchronize(); _t2 = time.monotonic()
                 self.native.set_routing(row_hashes, row_nonces, row_steps)
+                if _diag:
+                    torch.cuda.synchronize(); _t3 = time.monotonic()
+                    tot = (_t3 - _t0) * 1000
+                    if tot > 50:
+                        n_pre = sum(1 for m in metadata if m.get("length", 1) > 1)
+                        logger.info("poc: pre_forward %.0f мс (build=%.0f, hashes=%.0f, "
+                                    "routing=%.0f; rows=%d, prefill_rows=%d)",
+                                    tot, (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
+                                    (_t3 - _t2) * 1000, n_rows, n_pre)
 
     def _batch_view(self) -> tuple:
         ib = self.runner.input_batch

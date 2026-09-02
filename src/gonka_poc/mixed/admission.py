@@ -121,8 +121,15 @@ def _step_timer(scheduler, kind: str, prev_sched: int = -1, running: int = 0) ->
         st = scheduler._poc_step_stat = {"t": now, "t0": now, "d": {}}
         return
     d = st["d"].setdefault(kind, [])
-    d.append((now - st["t"]) * 1000.0)
+    dt = (now - st["t"]) * 1000.0
+    d.append(dt)
     st["t"] = now
+    if 300.0 < dt < 5000.0:
+        fin = getattr(scheduler, "finished_req_ids", None)
+        logger.info("poc: долгий шаг %.0f мс — prev sched=%d, running=%d, "
+                    "waiting=%d, finished_in_step=%s",
+                    dt, prev_sched, running, len(scheduler.waiting),
+                    len(fin) if fin is not None else "?")
     comp = st.setdefault("comp", {})
     key = f"{kind}:sched={prev_sched}/run={running}"
     comp[key] = comp.get(key, 0) + 1
@@ -165,6 +172,14 @@ def _kv_headroom_allow(scheduler):
         return max(0, (free - reserve) // need)
     except Exception:  # noqa: BLE001 — гейт-помощник, не должен ронять шаг
         return None
+
+
+def _prefill_per_step() -> int:
+    import os
+    try:
+        return int(os.environ.get("POC_PREFILL_PER_STEP", "0") or 0)
+    except ValueError:
+        return 0
 
 
 class PoCAdmission:
@@ -294,6 +309,13 @@ class PoCAdmission:
         self._prefill_allow = None
         if poc_will_prefill:
             self._prefill_allow = _kv_headroom_allow(scheduler)
+            # POC_PREFILL_PER_STEP=k: не больше k новых префиллов PoC за шаг.
+            # Смысл в режиме как-чат: маленькая порция префилла в декодном шаге
+            # держит шаг в размере графа вместо eager-волны на 16k токенов.
+            k = _prefill_per_step()
+            if k > 0:
+                self._prefill_allow = k if self._prefill_allow is None \
+                    else min(self._prefill_allow, k)
             if self._prefill_allow == 0:
                 poc_will_prefill = False
         prev = getattr(scheduler, "_poc_admission", None)

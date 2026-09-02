@@ -43,6 +43,18 @@ def _vector_artifact_cfg(runner) -> bool:
     return bool(getattr(cc, "poc_vector_artifacts", False)) if cc is not None else False
 
 
+_EMIT_STAT = {"n": 0, "k": 0.0, "q": 0.0, "q_steps": 0}
+_VEC_STAT = {"n": 0, "mt": None, "len": None, "has_mgr": None}
+
+
+def _diag_now():
+    """POC_DIAG=1: монотонное время (сек) для таймеров эмиссии; иначе None."""
+    import os, time
+    if os.environ.get("POC_DIAG", "") != "1":
+        return None
+    return time.monotonic()
+
+
 def keep_q_step(step: int, debug: bool, va_on: bool) -> bool:
     """Which decode steps retain their pre-snap q for emission: every step under
     debug or poc_vector_artifacts (aligned to the PoC step count — one vector per
@@ -65,13 +77,14 @@ def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
     from gonka_poc.poc.sphere import SPHERE_DIM
     if debug:
         return [encode_vector(row) for row in q_host]
+    from gonka_poc.poc.decode_random import random_pick_indices_decode_steps
     cpu = torch.device("cpu")
-    out = []
-    for step, row in enumerate(q_host):
-        idx = random_pick_indices_decode(
-            block_hash, public_key, [nonce], SPHERE_DIM, k_dim, cpu, step=step)[0].numpy()
-        out.append(encode_vector(row[idx]))
-    return out
+    # Одна пачка индексов на всю траекторию (см. random_pick_indices_decode_steps):
+    # побитово те же индексы, что пошаговые вызовы, без 257 сидов/topk на строку.
+    idx_all = random_pick_indices_decode_steps(
+        block_hash, public_key, nonce, SPHERE_DIM, k_dim, cpu,
+        list(range(len(q_host)))).numpy()
+    return [encode_vector(row[idx_all[step]]) for step, row in enumerate(q_host)]
 
 
 def slice_sampling_metadata(sm, rows, device):
@@ -244,11 +257,17 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     if mgr is None:
         cc = runner.cache_config
         sc = runner.vllm_config.scheduler_config
-        cap = resolve_poc_max_batch_size(
-            cc.poc_max_batch_size, sc.max_num_seqs,
-            poc_kv_capacity(
-                getattr(cc, "num_gpu_blocks", 0), getattr(cc, "block_size", 0),
-                cc.poc_seq_len, cc.poc_max_tokens))
+        # Слоты состояния не держат KV, поэтому пул сайзится по max_num_seqs
+        # (или явному poc_max_batch_size), а не по формуле ёмкости пула:
+        # под гибридным KV (DeepSeek V4) cache_config.block_size — блок самой
+        # мелкой группы, и poc_kv_capacity занижает пул в десятки раз (02.09.2026).
+        # Строка без слота проваливается в чисто префилловый путь и глушится
+        # на префилле — это тихая потеря нонсов, а не экономия.
+        cap = resolve_poc_max_batch_size(cc.poc_max_batch_size, sc.max_num_seqs, 0)
+        logger.info("poc: пул состояний decode-PoC: %d слотов (configured=%d, "
+                    "max_num_seqs=%d, num_gpu_blocks=%s, block_size=%s)",
+                    cap, cc.poc_max_batch_size, sc.max_num_seqs,
+                    getattr(cc, "num_gpu_blocks", None), getattr(cc, "block_size", None))
         mgr = PoCMixedDecodeManager(cap)
         runner._poc_mixed_decode_mgr = mgr
     return mgr
@@ -439,6 +458,19 @@ def build_unified_mixed_batch_inputs(
                     'decode_state': st, 'decode_step': decode_step,
                 })
                 offset += 1
+            elif (st is None and poc_params.max_tokens > 0
+                  and req_state.num_computed_tokens >= seq_len):
+                # Призрак: decode-строка уже завершена и её состояние освобождено
+                # (эмиссия прошла), но асинхронный планировщик успел поставить ей
+                # ещё один шаг до обработки вывода. Раньше она проваливалась в
+                # ветку чисто префиллового PoC: генерация входов, отражения Хаара
+                # и копия на хост с синхронизацией на КАЖДУЮ такую строку — шаг
+                # после завершения 63 строк стоил ~1 с (4×H100, 02.09.2026).
+                # Вывод призрака никому не нужен: нули, маска False, без метаданных.
+                unified_embeds[offset:offset + num_tokens].zero_()
+                unified_positions[offset:offset + num_tokens] = (
+                    chat_positions[offset:offset + num_tokens])
+                offset += num_tokens
             else:
                 # Prefill (prefill-only PoC, or the prefill step of a decode-PoC).
                 poc_len = num_tokens
@@ -627,6 +659,11 @@ def process_poc_outputs_from_hidden(
 
         if st is None:
             # Prefill-only PoC: just the vector_b64 artifact.
+            if _diag_now() is not None:
+                _VEC_STAT["n"] += 1
+                _VEC_STAT["mt"] = poc_params.max_tokens
+                _VEC_STAT["len"] = meta['length']
+                _VEC_STAT["has_mgr"] = get_decode_manager(runner).get(meta['req_id']) is not None
             poc_outputs[meta['req_id']] = PoCOutput(
                 nonce=nonce, vector_b64=_vector_b64())
             continue
@@ -738,6 +775,7 @@ def process_poc_outputs_from_hidden(
             else:
                 st.prev_k_t = k_t
             if step >= st.max_tokens:
+                _emit_t0 = _diag_now()
                 # End-of-sequence: ONE host copy of the trajectory + the DEFERRED
                 # reductions (emit-once). n_nan = non-finite steps (snap marks k=-1);
                 # mismatch = confident (margin>=tau) finite disagreements vs the reference
@@ -760,6 +798,7 @@ def process_poc_outputs_from_hidden(
                         "(compute fault, NOT fraud; excluded from mismatch rate) — "
                         "trajectory suspect, re-run on a clean GPU",
                         meta['poc_params'].nonce, n_nan, len(k_points))
+                _emit_t1 = _diag_now()
                 sph_vals = []
                 if st.q_steps_t:
                     # cat on device, then ONE host copy for the whole trajectory
@@ -769,6 +808,12 @@ def process_poc_outputs_from_hidden(
                     sph_vals = encode_sph_slices(
                         q_host, pp.block_hash, pp.public_key, pp.nonce,
                         pp.k_dim, pp.debug)
+                _emit_t2 = _diag_now()
+                if _emit_t0 is not None:
+                    _EMIT_STAT["n"] += 1
+                    _EMIT_STAT["k"] += _emit_t1 - _emit_t0
+                    _EMIT_STAT["q"] += _emit_t2 - _emit_t1
+                    _EMIT_STAT["q_steps"] += len(st.q_steps_t)
                 poc_outputs[meta['req_id']] = PoCOutput(
                     nonce=meta['poc_params'].nonce,
                     vector_b64="",
@@ -788,5 +833,16 @@ def process_poc_outputs_from_hidden(
                 (_metas_key[0], tuple(s + 1 for s in _metas_key[1])),
                 _chain_prev_candidate)
 
+    if _VEC_STAT["n"]:
+        logger.info("poc: vector_b64 (ветка st is None) для %d строк в шаге: "
+                    "max_tokens=%s length=%s слот в менеджере есть=%s",
+                    _VEC_STAT["n"], _VEC_STAT["mt"], _VEC_STAT["len"], _VEC_STAT["has_mgr"])
+        _VEC_STAT.update(n=0)
+    if _EMIT_STAT["n"]:
+        logger.info("poc: эмиссия %d строк: k/margin (cat+tolist+item) %.0f мс, "
+                    "q (cat+cpu+encode) %.0f мс, q_steps на строку %.0f",
+                    _EMIT_STAT["n"], _EMIT_STAT["k"] * 1000, _EMIT_STAT["q"] * 1000,
+                    _EMIT_STAT["q_steps"] / _EMIT_STAT["n"])
+        _EMIT_STAT.update(n=0, k=0.0, q=0.0, q_steps=0)
     return poc_outputs
 

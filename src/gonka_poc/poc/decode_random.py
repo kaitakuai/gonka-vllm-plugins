@@ -300,3 +300,30 @@ def random_pick_indices_decode(
     scores = _batched_murmur3_32(all_idx, seed_tensor)
     _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
     return chosen.to(torch.int64)
+
+
+def random_pick_indices_decode_steps(
+    block_hash: str,
+    public_key: str,
+    nonce: int,
+    dim: int,
+    k: int,
+    device: torch.device,
+    steps: List[int],
+) -> torch.Tensor:
+    """Те же индексы, что random_pick_indices_decode(..., [nonce], step=s) для
+    каждого s из steps, но одной пачкой [len(steps), k]: одна строка сидов на
+    шаг, один murmur и один topk. Для эмиссии траектории (257 шагов на строку):
+    257 отдельных вызовов стоили ~15 мс на строку хоста, пачка — ~1 мс.
+    Семантика вызова с prev_point_ids не воспроизводится (в эмиссии не нужна)."""
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+    seeds = [_seed_from_string(
+        f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}_decode{step}")
+        for step in steps]
+    all_idx = torch.arange(dim, device=device, dtype=torch.int32).unsqueeze(0).expand(
+        len(steps), -1)
+    seed_tensor = torch.tensor(seeds, dtype=torch.int64, device=device).unsqueeze(1)
+    scores = _batched_murmur3_32(all_idx, seed_tensor)
+    _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False, dim=1)
+    return chosen.to(torch.int64)
