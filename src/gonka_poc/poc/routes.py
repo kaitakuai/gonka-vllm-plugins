@@ -518,7 +518,23 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         validation_nonces = set(a.nonce for a in body.validation.artifacts)
         if validation_nonces != set(body.nonces):
             raise HTTPException(status_code=400, detail="validation.artifacts nonces must match nonces field")
-    
+
+    enforced_k_steps = body.enforced_k_steps
+    if (body.validation and body.params.scheme == "decode"
+            and enforced_k_steps is None):
+        # The wire form carries the reference trajectory inside each artifact.
+        # Without teacher-forcing it, every computed artifact comes back with
+        # n_sphere_mismatches=-1 (nothing compared) and the verdict is vacuous.
+        missing = [a.nonce for a in body.validation.artifacts
+                   if not a.k_points_steps]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=("decode validation needs k_points_steps for every "
+                        f"artifact, missing for nonces {missing[:8]}"))
+        enforced_k_steps = {a.nonce: list(a.k_points_steps)
+                            for a in body.validation.artifacts}
+
     validation_map = {a.nonce: a.vector_b64 for a in body.validation.artifacts} if body.validation else None
     # prover-side pre-snap slices (reference generated with debug or
     # poc_vector_artifacts):
@@ -553,7 +569,7 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             poc_stronger_rng=body.poc_stronger_rng,
             poc_decode=(body.params.scheme == "decode"),
             max_tokens=body.params.max_tokens,
-            enforced_k_steps=body.enforced_k_steps,
+            enforced_k_steps=enforced_k_steps,
             debug=body.debug,
             per_nonce_reflection=body.per_nonce_reflection,
             validation_artifacts=validation_map,
@@ -602,9 +618,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
                 await asyncio.sleep(0.1)
 
             chunk_inference_steps = None
-            if body.enforced_k_steps:
-                chunk_inference_steps = {n: body.enforced_k_steps[n]
-                                         for n in chunk if n in body.enforced_k_steps}
+            if enforced_k_steps:
+                chunk_inference_steps = {n: enforced_k_steps[n]
+                                         for n in chunk if n in enforced_k_steps}
 
             try:
                 artifacts = await _compute_artifacts_chunk(
@@ -648,19 +664,23 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             detail=(f"validation aborted: {len(computed_artifacts)} of "
                     f"{len(body.nonces)} nonces produced an artifact"))
 
-    validation_result = run_validation(
-        computed_artifacts=computed_artifacts,
-        validation_map=validation_map,
-        n_total=len(body.nonces),
-        dist_threshold=stat_test.dist_threshold,
-        p_mismatch=stat_test.p_mismatch,
-        fraud_threshold=stat_test.fraud_threshold,
-        k_dim=body.params.k_dim,
-        # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
-        # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
-        use_trajectory=body.params.max_tokens > 0,
-        ref_vectors=ref_vectors,
-    )
+    try:
+        validation_result = run_validation(
+            computed_artifacts=computed_artifacts,
+            validation_map=validation_map,
+            n_total=len(body.nonces),
+            dist_threshold=stat_test.dist_threshold,
+            p_mismatch=stat_test.p_mismatch,
+            fraud_threshold=stat_test.fraud_threshold,
+            k_dim=body.params.k_dim,
+            # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
+            # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
+            use_trajectory=body.params.max_tokens > 0,
+            ref_vectors=ref_vectors,
+        )
+    except ValueError as e:
+        # No comparison happened for some artifact: not a verdict.
+        raise HTTPException(status_code=503, detail=f"validation aborted: {e}")
 
     return {
         "status": "completed",

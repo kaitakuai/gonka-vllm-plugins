@@ -179,9 +179,13 @@ def run_validation(
             traj = a.get("k_points_steps") or []
             if not traj:
                 continue
-            m = a.get("n_sphere_mismatches", 0) or 0
-            if m < 0:  # -1 == generation (no reference); treat as no mismatch
-                m = 0
+            m = a.get("n_sphere_mismatches")
+            if m is None or m < 0:
+                # -1 == no reference was teacher-forced, so nothing was
+                # compared. Counting it as zero mismatches would clear any
+                # prover whose trajectory the validator never looked at.
+                raise ValueError(
+                    f"nonce {a['nonce']}: no reference trajectory was compared")
             n_mismatch += m
             n_steps += len(traj)
             per_nonce.append({"nonce": a["nonce"], "n_sphere_mismatches": m, "n_steps": len(traj)})
