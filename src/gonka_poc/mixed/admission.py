@@ -142,13 +142,38 @@ def _step_timer(scheduler, kind: str, prev_sched: int = -1, running: int = 0) ->
         st["comp"] = {}
 
 
+def _kv_headroom_allow(scheduler):
+    """Сколько префиллов PoC можно посадить в этот шаг, чтобы после них в пуле
+    остался запас: по блоку на каждую бегущую строку (рост на шаге) плюс доля
+    POC_KV_HEADROOM (по умолчанию 1%) от пула. None — внутренности vLLM
+    недоступны, гейт выключен. Проверка на первой строке недостаточна: волна до
+    MNBT/seq_len префиллов в одном шаге (63 на H100) перекрывает любой запас."""
+    import os
+    try:
+        km = scheduler.kv_cache_manager
+        free = km.block_pool.get_num_free_blocks()
+        total = km.block_pool.num_gpu_blocks
+        need = 0
+        for r in scheduler.waiting:
+            if r.poc_params is not None:
+                need = scheduler._request_remaining_blocks(r)
+                break
+        if need <= 0:
+            return None
+        frac = float(os.environ.get("POC_KV_HEADROOM", "0.01") or 0.0)
+        reserve = len(scheduler.running) + int(total * frac)
+        return max(0, (free - reserve) // need)
+    except Exception:  # noqa: BLE001 — гейт-помощник, не должен ронять шаг
+        return None
+
+
 class PoCAdmission:
     """Decides which PoC/chat requests may enter the current forward."""
 
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
                  "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
                  "_scheduler", "_prefill_landing", "_any_scheduled", "_stalled",
-                 "_new_prefills")
+                 "_new_prefills", "_prefill_allow")
 
     # Сколько шагов держать шаг за декодом после застрявшего префилла, прежде
     # чем снова попробовать префилл (если ни одна строка не завершилась раньше).
@@ -261,6 +286,16 @@ class PoCAdmission:
         # префилла. Тогда шаг отдаётся декоду (ожидающие строки удерживаются,
         # шаг остаётся однородным). Префилл пробуем снова, когда хоть одна
         # строка завершилась (running уменьшился) или каждые STALL_RETRY_STEPS.
+        # Запас KV: не сажать новый префилл PoC, если после него пулу не хватит
+        # на рост бегущих строк (по блоку на строку) и на долю запаса.
+        # Иначе банкет доводит пул до 100% и vLLM вытесняет строки (2 вытеснения
+        # за прогон 600 при капе 512, 02.09.2026). Ожидающие просто ждут, шаг
+        # отдаётся декоду — префилл вернётся, когда строки завершатся.
+        self._prefill_allow = None
+        if poc_will_prefill:
+            self._prefill_allow = _kv_headroom_allow(scheduler)
+            if self._prefill_allow == 0:
+                poc_will_prefill = False
         prev = getattr(scheduler, "_poc_admission", None)
         stalled = False
         if poc_will_prefill:
@@ -324,7 +359,9 @@ class PoCAdmission:
             return True
         # Шаг отдан декоду после застрявшего префилла: ожидающие строки ждут,
         # пока декод освободит KV (шаг остаётся однородным).
-        if self._stalled and request.num_computed_tokens == 0:
+        if request.num_computed_tokens == 0 and (
+                self._stalled or (self._prefill_allow is not None
+                                  and self._new_prefills >= self._prefill_allow)):
             return True
         # Префилл этой строки сел в прошлом шаге — её вывод ещё в полёте.
         if getattr(request, "request_id", None) in self._prefill_landing:
