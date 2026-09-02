@@ -3,6 +3,18 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-02 — Hopper decode-PoC: admission defects fixed, fused reflection
+
+R on 4×H100 (DeepSeek-V4, vLLM 0.28) went from 0.47 to 1.07 without touching
+kernels, TP or the PoC math. The hang above ~160 nonces was a livelock of the
+uniform-step rule; the low R was a per-step cap of 134 rows computed from a KV
+formula that misreads hybrid KV block sizes. Six admission defects fixed, one
+Triton kernel added. Uniform-step remains the default (better next to live
+chat); `POC_CHAT_LIKE=1` stays an option. Verdict unchanged in every
+corpus↔engine combination (0 at τ=0.05).
+
+See [ADR-0016](adr/ADR-0016-hopper-admission-and-fused-reflection.md).
+
 ## 2026-07-24 — First tag cut: `v0.1.0a0`
 
 The repository had no tags, so every downstream consumer pinned either a branch

@@ -34,6 +34,22 @@ vllm serve <model>
 Boot log confirms: `PoC implementation: gonka_poc... (plugin)`.
 PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
+## Runtime knobs (plugin-side, environment of the server)
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `POC_CHAT_LIKE` | off | PoC rows are scheduled like chat: prefill shares the step with decode, no uniform-step isolation. Faster alone (~5%), worse next to live chat. |
+| `POC_KV_HEADROOM` | `0.01` | fraction of the KV pool kept free when admitting PoC prefills (plus one block per running row). |
+| `POC_FUSED_REFLECT` | `1` | Triton one-pass Householder reflection; `0` restores the four-kernel reference path. |
+| `POC_ROLLING_WINDOW` / `POC_ROLLING_WAVE` | off | client-side rolling admission (window of concurrent nonces, wave size). |
+| `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_CHAT_LIKE`). |
+| `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
+| `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
+
+`poc_max_batch_size`, `poc_share`, `poc_seq_len`, `poc_max_tokens` are read
+through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI
+arguments for PoC. See [ADR-0016](docs/adr/ADR-0016-hopper-admission-and-fused-reflection.md).
+
 ## Package layout
 
 ```
