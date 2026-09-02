@@ -192,6 +192,10 @@ class PoCRunnerBridge:
                 self.native.set_routing(row_hashes, row_nonces, row_steps)
                 if _diag:
                     torch.cuda.synchronize(); _t3 = time.monotonic()
+                    self._diag_ev0 = torch.cuda.Event(enable_timing=True)
+                    self._diag_ev0.record()
+                    self._diag_host0 = time.monotonic()
+                    self._diag_tokens = int(num_total_tokens)
                     tot = (_t3 - _t0) * 1000
                     if tot > 50:
                         n_pre = sum(1 for m in metadata if m.get("length", 1) > 1)
@@ -208,6 +212,16 @@ class PoCRunnerBridge:
                 ) -> "dict[str, PoCOutput] | None":
         if self._step is None or self._step.get("poc_metadata") is None:
             return None
+        if _poc_diag() and getattr(self, "_diag_ev0", None) is not None:
+            import time
+            ev1 = torch.cuda.Event(enable_timing=True); ev1.record(); ev1.synchronize()
+            gpu_ms = self._diag_ev0.elapsed_time(ev1)
+            host_ms = (time.monotonic() - self._diag_host0) * 1000
+            if gpu_ms > 150 or host_ms > 150:
+                logger.info("poc: форвард gpu=%.0f мс host=%.0f мс, tokens=%d, poc_rows=%d",
+                            gpu_ms, host_ms, self._diag_tokens,
+                            len(self._step.get("poc_metadata") or ()))
+            self._diag_ev0 = None
         out = mixed_decode.process_poc_outputs_from_hidden(
             self.runner, hidden_states, self._step["poc_metadata"])
         if out:
