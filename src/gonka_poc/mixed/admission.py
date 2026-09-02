@@ -202,6 +202,10 @@ class PoCAdmission:
         # scanned twice per step for nothing.
         poc_present = chat_present = False
         poc_will_prefill = chat_will_prefill = False
+        chat_running = 0
+        for r in scheduler.running:
+            if r.poc_params is None:
+                chat_running += 1
         for q in queues:
             for r in q:
                 if r.poc_params is not None:
@@ -278,7 +282,11 @@ class PoCAdmission:
                              "compilation_config", None),
                      "max_cudagraph_capture_size", None)
         if cg and not poc_cfg(cache_config, "poc_max_batch_size"):
-            self._max_batch = min(self._max_batch, int(cg))
+            # Граф захватывает шаг ЦЕЛИКОМ, чат в нём тоже: при чате c=256 и
+            # 512 строках PoC шаг на 768 строк уходил в eager, и оба теряли
+            # по три четверти скорости (4×H100, 02.09.2026). Кап PoC — остаток
+            # графа после бегущих чатовых строк.
+            self._max_batch = max(1, min(self._max_batch, int(cg) - chat_running))
         if not getattr(scheduler, "_poc_max_batch_logged", False):
             scheduler._poc_max_batch_logged = True
             logger.info("poc: строк PoC на шаг не более %d (hybrid_kv=%s, "
