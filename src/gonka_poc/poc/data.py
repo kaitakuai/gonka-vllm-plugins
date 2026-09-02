@@ -11,6 +11,10 @@ from scipy.stats import binomtest
 DEFAULT_DIST_THRESHOLD = 0.02
 DEFAULT_P_MISMATCH = 0.001
 DEFAULT_FRAUD_THRESHOLD = 0.01
+# Decode: the snap margin above which a teacher-forced disagreement counts as a
+# different computation rather than boundary jitter. Sent by the chain as
+# stat_test.dist_threshold for decode models; this is only the fallback.
+DEFAULT_MARGIN_TAU = 0.025
 
 
 @dataclass

@@ -12,7 +12,10 @@ from pydantic import BaseModel, ConfigDict
 
 import logging
 from gonka_poc.poc.config import PoCState
-from gonka_poc.poc.data import Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_P_MISMATCH, DEFAULT_FRAUD_THRESHOLD
+from gonka_poc.poc.data import (
+    Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
+    DEFAULT_FRAUD_THRESHOLD,
+)
 from gonka_poc.poc.callbacks import CallbackSender
 from gonka_poc.poc.generate_queue import (
     GenerateJob, get_queue, clear_queue, POC_MAX_QUEUED_NONCES,
@@ -541,7 +544,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     # lets run_validation attach the continuous vector-channel score as evidence.
     ref_vectors = {a.nonce: a.sph_values_steps for a in body.validation.artifacts
                    if a.sph_values_steps} if body.validation else None
-    stat_test = body.stat_test or StatTestModel()
+    stat_test = body.stat_test or StatTestModel(
+        dist_threshold=(DEFAULT_MARGIN_TAU if body.params.scheme == "decode"
+                        else DEFAULT_DIST_THRESHOLD))
     
     if not body.wait:
         queue = get_queue()
@@ -673,8 +678,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
             p_mismatch=stat_test.p_mismatch,
             fraud_threshold=stat_test.fraud_threshold,
             k_dim=body.params.k_dim,
-            # decode flow (max_tokens>0) → count sphere_k mismatches vs p_mismatch;
-            # prefill flow → vector-L2 + binomial (unchanged). Same response shape.
+            # decode flow (max_tokens>0) → per-nonce snap margin vs dist_threshold
+            # (tau); prefill flow → vector-L2 vs dist_threshold. Same binomial,
+            # same response shape.
             use_trajectory=body.params.max_tokens > 0,
             ref_vectors=ref_vectors,
         )

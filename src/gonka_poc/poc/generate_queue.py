@@ -152,6 +152,7 @@ async def compute_nonce_artifacts(
                     "k_points_steps": get("k_points_steps", []),
                     "n_sphere_mismatches": get("n_sphere_mismatches", -1),
                     "n_nan_steps": get("n_nan_steps", 0),
+                    "mismatch_margin_max": get("mismatch_margin_max", 0.0),
                 }
                 if debug:
                     artifact["sph_indices_steps"] = get("sph_indices_steps", [])
