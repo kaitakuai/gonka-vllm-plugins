@@ -440,6 +440,13 @@ class GenerateQueue:
             "server_engine": _server_engine(),
             }
         
+        if len(computed_artifacts) != len(job.nonces):
+            # Same rule as the wait path: a verdict over a partial nonce set is
+            # not evidence of honesty, it is a failed job.
+            raise RuntimeError(
+                f"validation aborted: {len(computed_artifacts)} of "
+                f"{len(job.nonces)} nonces produced an artifact")
+
         validation_result = run_validation(
             computed_artifacts=computed_artifacts,
             validation_map=job.validation_artifacts,
