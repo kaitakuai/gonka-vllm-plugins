@@ -87,6 +87,7 @@ stall pool dumps, per-phase timers.
 | R vs chat c=512 | 0.47 | 1.07 (chat-like, all fixes; 0.95 before the fused kernel) |
 | cohort 164 vs chat 164 | 16.3 s vs 10.6 s | 10.2 s vs 10.6 s |
 | verdict | — | 0 mismatches at τ=0.05 across modes and kernels |
+| 1×B300 FP8, same branch (03.09) | 26.1 nonce/s, R 0.83 | 45.7 nonce/s, chat c=512 34.9 req/s, R 1.31; H100→B300 cross-hardware validation 1/154 200 at τ=0.05 |
 
 Structural differences that remain between PoC and chat: seeded inputs and
 pseudo token ids instead of an embedding lookup, in-layer reflections and
