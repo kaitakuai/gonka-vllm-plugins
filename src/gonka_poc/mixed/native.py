@@ -677,6 +677,10 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
+    from gonka_poc.poc.decode_random import set_ladder_base_for_model
+    _mt = getattr(hf_config, "model_type", None)
+    logger.info("PoC seeded-routing ladder base: %d (model_type=%s)",
+                set_ladder_base_for_model(_mt), _mt)
     # The fused reflect JIT-compiles on first call; do it here, before CUDA-graph
     # capture, so the JIT does not land inside the capture.
     try:

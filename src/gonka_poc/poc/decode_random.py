@@ -152,12 +152,27 @@ def random_pick_indices_gpu(
     return chosen.to(torch.int64)
 
 
-# Ladder offset. The router adds ``e_score_correction_bias`` after scoring, so
-# the ladder floor ``scoring_func(LADDER_BASE + 1)`` must exceed any bias spread,
-# otherwise an unforced expert can outvote a forced one. sqrtsoftplus(101) ~= 10
-# is an order of magnitude above every router bias measured (see ADR). The
-# seeded set is unchanged; only the run's weights flatten.
-LADDER_BASE = 100
+# Ladder offset, a per-model consensus parameter. The router adds
+# ``e_score_correction_bias`` after scoring, so on DeepSeek-V4 (sqrtsoftplus
+# scoring) the ladder floor ``scoring_func(base + 1)`` must exceed any bias
+# spread, otherwise an unforced expert can outvote a forced one; sqrtsoftplus(101)
+# ~= 10 is an order of magnitude above every bias measured (see ADR). Any other
+# model keeps base 0: a non-zero base changes which experts win under bias, and
+# the MiniMax golden cells were frozen with base 0 (03.09: base 100 doubled the
+# tau=0 mismatch rate on every MiniMax reference corpus).
+_LADDER_BASE_BY_MODEL = {"deepseek_v4": 100}
+_ladder_base = 0
+
+
+def set_ladder_base_for_model(model_type) -> int:
+    """Select the ladder base for ``model_type`` (called once at attach)."""
+    global _ladder_base
+    _ladder_base = _LADDER_BASE_BY_MODEL.get(model_type, 0)
+    return _ladder_base
+
+
+def ladder_base() -> int:
+    return _ladder_base
 
 
 def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
@@ -172,7 +187,7 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     (seeds are public) — consensus security lives in the seeded embeds,
     per-layer reflections and the chained snap. Returns [B, n_experts]
     forced logits: the chosen run holds descending ladder values
-    ``LADDER_BASE+top_k .. LADDER_BASE+1``,
+    ``base+top_k .. base+1`` (``base`` from ``set_ladder_base_for_model``),
     the rest a low floor."""
     b = seed.shape[0]
     start = torch.remainder(seed.view(-1, 1), n_experts)             # [B,1]
@@ -183,7 +198,7 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     logits.scatter_(1, chosen,
                     (torch.arange(top_k, 0, -1, device=device,
                                   dtype=torch.float32)
-                     + LADDER_BASE).unsqueeze(0).expand(b, -1))
+                     + _ladder_base).unsqueeze(0).expand(b, -1))
     return logits
 
 
