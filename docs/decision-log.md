@@ -3,6 +3,31 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-03 — Values read in traced code go through buffers, never Python constants
+
+A ladder-base experiment on 1×B300 (MiniMax-M2.7, base 100 then base 0 on the same
+host) produced honest cross-hardware cells of 15–17% at τ=0 instead of 8%, in both
+directions and across boots, with expert-level flips (τ=0.05 no longer zero). Attribution
+and a git bisect of the plugin on B300 (probe: validate a corpus made by the old stack on
+the same card, plus H100 corpora) showed every "bad" boot loading the compiled graph from
+vLLM's cache and every "good" one compiling fresh. Cause: the ladder base was a module
+global read inside the router wrapper's forward, which is traced and captured; Dynamo
+baked the value into the graph, and the compile-cache key hashes the traced source and
+the config, not that value. The first boot on the code compiled with base 100 and every
+later base-0 boot with the same code and batch config ran base 100 while logging base 0.
+The 16% cells were base mismatch (the same doubling as the golden regression), not
+hardware noise; honest MiniMax noise does not depend on the base.
+
+Fix 4a6a230: the base lives in a 0-dim buffer on the wrapper and is read by the graph
+like the seed, step and mask buffers. Verified on 1×B300 with a controlled triple on a
+fresh cache root (boot base 100, boot base 0, boot base 100 that loads the base-0 graph
+and AOT artifact): without the fix the third boot validates base-0 corpora at 8% while
+logging base 100 (it runs base 0); with the fix it gives 16% (true base 100), and a
+base-0 boot on the same cache stays at 8%. Rule: anything the forward reads that can differ
+between boots (env, config, per-model tables) must be a buffer or part of the cache key;
+boot provenance now records the compile-cache key and whether the graph was loaded or
+compiled.
+
 ## 2026-09-03 — Seeded-routing ladder base is per model
 
 Validating the frozen MiniMax-M2.7 reference corpora (48 corpora, 10 block hashes,
