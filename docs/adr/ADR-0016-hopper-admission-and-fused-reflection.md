@@ -53,14 +53,21 @@ stall pool dumps, per-phase timers.
    prefill-only path (fresh inputs, Haar-rotated vector artifact, host copy
    with a sync per row). Such rows now get zero inputs, a cleared mask and no
    metadata.
-5. **Uniform-step stays the default; chat-like is an option.** Alone, chat-like
-   (`POC_CHAT_LIKE=1`) is ~5% faster and the verdict is identical (four
-   corpus↔engine combinations, 0 mismatches at τ=0.05, τ=0 noise 7.1–7.3% in
-   every case). Next to live chat (`poc_share=0.5`, chat c=256) uniform-step
-   is better for both sides: PoC 1500 in 100 s vs 110 s, chat 9.4 vs 7.6
-   req/s (share sum 1.09 vs 0.93). The only documented motive for the rule in
-   the ported code was cudagraph rungs; on 0.28/V4 its real value is keeping
-   chat decode out of PoC's eager prefill steps.
+5. **Chat-like scheduling is the default; uniform-step stays as `POC_CHAT_LIKE=0`.**
+   The verdict is identical in both modes (four corpus↔engine combinations,
+   0 mismatches at τ=0.05, τ=0 noise 7.1–7.3% in every case). An earlier
+   measurement favoured uniform-step next to live chat, but that number was
+   produced while the admission scan ignored `skipped_waiting`, which let
+   deferred rows bypass the isolation — a half chat-like mode by accident.
+   With the scan fixed (review finding, 03.09) the honest comparison is:
+   alone, chat-like 600 in 25.8 s vs 26.4 s, 3000 in 108.1 s vs 110.8 s;
+   next to live chat (`poc_share=0.5`, chat c=256): PoC 1500 in 108 s and
+   chat 7.7 req/s vs 137 s and 7.1 req/s for uniform-step. The only
+   documented motive for uniform-step in the ported code was cudagraph rungs;
+   on 0.28/V4 a step with a prefill is eager either way, so isolation only
+   stalls the decode rows. Chat-like also keeps PoC structurally closest to
+   chat (same step composition, same knobs), which is what a rational miner
+   should be tuning for.
 6. **Fused Householder reflection (Triton) instead of `torch.compile`.** The
    reflection ran as four eager kernels (`mul`, `sum`, `sub`, `where`) per
    layer on 16k-token prefill batches. A hand-written Triton kernel does it in
@@ -77,7 +84,7 @@ stall pool dumps, per-phase timers.
 | 4×H100, sustained (banquet 3000) | before | after |
 | --- | ---: | ---: |
 | PoC nonce/s | 12.2 (window 160, hangs above) | 27.7 |
-| R vs chat c=512 | 0.47 | 1.07 (0.95 before the fused kernel; 0.90 in uniform-step) |
+| R vs chat c=512 | 0.47 | 1.07 (chat-like, all fixes; 0.95 before the fused kernel) |
 | cohort 164 vs chat 164 | 16.3 s vs 10.6 s | 10.2 s vs 10.6 s |
 | verdict | — | 0 mismatches at τ=0.05 across modes and kernels |
 
@@ -87,7 +94,17 @@ seeded routing (free in-graph, ~one pass in eager prefill), no logits or
 sampling for PoC rows, emit-once output. PoC rows are not preemptible; the
 headroom gate stands in for preemption.
 
+Review (multi-agent, 03.09) added: a step-budget guard (a PoC prefill is
+all-or-nothing and must fit the remaining step budget — with chat in the same
+step the old code could exceed `max_num_batched_tokens`), the
+`skipped_waiting` scan, a loud `POC_ABLATE` warning, and unit tests for the
+admission gates on a fake scheduler. Vlad's merged branch (`7f77c07`) needs
+`PoCOutput.mismatch_margin_max`; the 0.28 residual carries it since
+`b3ad15a` (kaitakuai/vllm `mixed-poc-vllm-0.28.0-dev`).
+
 Open: coordinate the admission changes with the in-tree scheduler work
 (PR #3, KV-lease); not measured on NVFP4 or H200; `poc_cudagraph_capture_size`
 (raise capture size to the PoC batch) not applied on 0.28 — the cap follows
-the 512 default.
+the 512 default; Vlad's `test_06_prefill_only_degenerate` expects one
+trajectory point for `max_tokens=0` under the decode scheme while the
+prefill-only path emits a vector only — to be settled with him.

@@ -9,8 +9,9 @@ R on 4×H100 (DeepSeek-V4, vLLM 0.28) went from 0.47 to 1.07 without touching
 kernels, TP or the PoC math. The hang above ~160 nonces was a livelock of the
 uniform-step rule; the low R was a per-step cap of 134 rows computed from a KV
 formula that misreads hybrid KV block sizes. Six admission defects fixed, one
-Triton kernel added. Uniform-step remains the default (better next to live
-chat); `POC_CHAT_LIKE=1` stays an option. Verdict unchanged in every
+Triton kernel added. Chat-like scheduling became the default on 03.09 (the
+earlier uniform-step advantage next to live chat came from an admission scan
+that bypassed the isolation); `POC_CHAT_LIKE=0` restores uniform-step. Verdict unchanged in every
 corpus↔engine combination (0 at τ=0.05).
 
 See [ADR-0016](adr/ADR-0016-hopper-admission-and-fused-reflection.md).

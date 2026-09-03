@@ -41,7 +41,7 @@ def make_sched(running=(), waiting=(), skipped=(), free=10000, total=17278, cg=5
 
 
 def test_cap_is_cudagraph_minus_chat_rows(monkeypatch):
-    monkeypatch.delenv("POC_CHAT_LIKE", raising=False)
+    monkeypatch.setenv("POC_CHAT_LIKE", "0")
     chat = [Req(f"c{i}", False, computed=300) for i in range(256)]
     poc = [Req(f"p{i}", True, computed=300) for i in range(10)]
     a = PoCAdmission(make_sched(running=chat + poc), token_budget=16384)
@@ -73,7 +73,7 @@ def test_headroom_limits_prefills_per_step(monkeypatch):
 
 
 def test_stall_hands_next_step_to_decode(monkeypatch):
-    monkeypatch.delenv("POC_CHAT_LIKE", raising=False)
+    monkeypatch.setenv("POC_CHAT_LIKE", "0")
     running = [Req(f"p{i}", True, computed=300) for i in range(3)]
     waiting = [Req("w0", True, computed=0)]
     s = make_sched(running=running, waiting=waiting, free=10000)
@@ -109,7 +109,7 @@ def test_step_budget_guard_refuses_partial_prefill(monkeypatch):
 
 
 def test_skipped_waiting_is_scanned(monkeypatch):
-    monkeypatch.delenv("POC_CHAT_LIKE", raising=False)
+    monkeypatch.setenv("POC_CHAT_LIKE", "0")
     running = [Req("p0", True, computed=300)]
     skipped = [Req("w0", True, computed=0)]
     a = PoCAdmission(make_sched(running=running, skipped=skipped, free=100000), token_budget=16384)

@@ -38,7 +38,7 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `POC_CHAT_LIKE` | off | PoC rows are scheduled like chat: prefill shares the step with decode, no uniform-step isolation. Faster alone (~5%), worse next to live chat. |
+| `POC_CHAT_LIKE` | on | PoC rows are scheduled like chat: prefill shares the step with decode, no uniform-step isolation. `0` restores uniform-step. With the admission fixes chat-like is faster alone and next to live chat (108 s / 7.7 req/s vs 137 s / 7.1 for PoC 1500 + chat c=256). |
 | `POC_KV_HEADROOM` | `0.01` | fraction of the KV pool kept free when admitting PoC prefills (plus one block per running row). |
 | `POC_FUSED_REFLECT` | `1` | Triton one-pass Householder reflection; `0` restores the four-kernel reference path. |
 | `POC_ROLLING_WINDOW` / `POC_ROLLING_WAVE` | off | client-side rolling admission (window of concurrent nonces, wave size). |
