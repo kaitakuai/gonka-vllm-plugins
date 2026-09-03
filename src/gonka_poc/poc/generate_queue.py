@@ -68,9 +68,9 @@ def _rolling_window(total_nonces: int) -> int:
     """Rolling admission window size; 0 = off (admit everything at once).
 
     POC_ROLLING_WINDOW: >0 — explicit window; 0/empty — off; "auto" — 256. The
-    plugin does not know the measured KV wall, so auto picks a conservative
-    value: below any measured decode-PoC wall, yet enough to keep the engine
-    fed (ladders saturate around 256-512).
+    plugin does not know the measured KV capacity limit, so auto picks a
+    conservative value: below any measured limit, yet enough to keep the engine
+    fed (throughput saturates around 256-512 concurrent nonces).
     """
     raw = os.environ.get("POC_ROLLING_WINDOW", "").strip().lower()
     if not raw or raw == "0":
@@ -85,23 +85,23 @@ def _rolling_window(total_nonces: int) -> int:
     return max(0, min(w, total_nonces))
 
 
-def _rolling_wave(window: int) -> int:
-    """Wave size: POC_ROLLING_WAVE or a quarter of the window (at least 16).
-    Smaller waves smooth the flow but add prefill steps that stall decode;
+def _rolling_refill(window: int) -> int:
+    """Refill size: POC_ROLLING_REFILL or a quarter of the window (at least 16).
+    Smaller refills smooth the flow but add prefill steps that stall decode;
     larger ones approach all-at-once admission."""
-    raw = os.environ.get("POC_ROLLING_WAVE", "").strip()
+    raw = os.environ.get("POC_ROLLING_REFILL", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return min(int(raw), window)
-    # Chat-like: admit one nonce at a time. Uniform-step is off there, so a
+    # Mixed batches: admit one nonce at a time. No decode-only isolation, so a
     # prefill in every step does not stop decode.
-    if os.environ.get("POC_CHAT_LIKE", "").strip() in ("1", "true", "yes"):
+    if os.environ.get("POC_MIXED_BATCH", "").strip() in ("1", "true", "yes"):
         return 1
     return max(16, min(window, window // 4))
 
 
-async def _run_in_waves(compute_one, nonces, window: int, wave: int):
-    """The first `window` nonces start together; afterwards, once `wave` slots
-    have freed (or nothing is in flight), the next wave is launched whole.
+async def _run_rolling(compute_one, nonces, window: int, refill: int):
+    """The first `window` nonces start together; afterwards, once `refill` slots
+    have freed (or nothing is in flight), the next `refill` nonces are launched.
     Returns results in the order of the input list."""
     results = [None] * len(nonces)
     pending = list(range(len(nonces)))
@@ -114,7 +114,7 @@ async def _run_in_waves(compute_one, nonces, window: int, wave: int):
         for idx in batch:
             running[asyncio.ensure_future(compute_one(nonces[idx]))] = idx
         if batch:
-            logger.info("PoC rolling admission: wave of %d (in flight %d, left %d)",
+            logger.info("PoC rolling admission: refill of %d (in flight %d, left %d)",
                         len(batch), len(running), len(pending))
 
     launch(window)
@@ -128,7 +128,7 @@ async def _run_in_waves(compute_one, nonces, window: int, wave: int):
                 logger.error("PoC rolling: nonce %s raised %r", nonces[idx], e)
                 results[idx] = None
             freed += 1
-        if pending and (freed >= wave or not running):
+        if pending and (freed >= refill or not running):
             launch(min(freed, len(pending)))
             freed = 0
     return results
@@ -214,12 +214,12 @@ async def compute_nonce_artifacts(
                     # PoC ran but emitted no artifact. Silent until 31.08: the
                     # nonce was dropped from the result list and the caller saw
                     # a short batch with no reason given. The dominant cause is
-                    # the KV wall — nonces admitted beyond what the pool holds
+                    # the KV capacity limit — nonces admitted beyond what the pool holds
                     # finish without a trajectory, and the ENGINE logs nothing:
                     # no preemption, no allocation failure. Say it here.
                     logger.warning(
                         "PoC nonce %s: no artifact emitted (request finished "
-                        "with empty poc_output). Usually the KV wall — the "
+                        "with empty poc_output). Usually the KV capacity limit — the "
                         "batch asked for more nonces than the pool holds.", nonce)
                     return None
                 get = poc_out.get if isinstance(poc_out, dict) else (
@@ -243,7 +243,7 @@ async def compute_nonce_artifacts(
                         artifact["sph_values_steps"] = sph_vals
                 # Second silent path: the artifact IS emitted but its trajectory
                 # is empty or short. The caller then gets a chain of length 0
-                # among full ones, which a benchmark happily counts as work.
+                # among full ones, which a benchmark counts as work.
                 # Only a length check catches it, and it costs one len() on data
                 # already in hand — nothing on the happy path.
                 if poc_decode and max_tokens:
@@ -261,19 +261,19 @@ async def compute_nonce_artifacts(
             _inflight.discard(request_id)
         return None
 
-    # Rolling admission in waves: the window caps concurrency, the wave is how
-    # many nonces are admitted at once (one at a time starves decode under
-    # uniform-step). POC_ROLLING_WINDOW=0 (default) = all-at-once admission.
+    # Rolling admission: the window caps concurrency, the refill is how many
+    # nonces are admitted at once (one at a time starves decode under
+    # decode-only steps). POC_ROLLING_WINDOW=0 (default) = all-at-once admission.
     window = _rolling_window(len(nonces))
     if window and len(nonces) > window:
-        wave = _rolling_wave(window)
-        logger.info("PoC rolling admission: %d nonces, window %d, wave %d",
-                    len(nonces), window, wave)
-        results = await _run_in_waves(compute_one, list(nonces), window, wave)
+        refill = _rolling_refill(window)
+        logger.info("PoC rolling admission: %d nonces, window %d, refill %d",
+                    len(nonces), window, refill)
+        results = await _run_rolling(compute_one, list(nonces), window, refill)
     else:
         results = await asyncio.gather(*[compute_one(n) for n in nonces])
     out = [r for r in results if r is not None]
-    # Batch-level summary. A per-nonce warning can drown in a 500-nonce round;
+    # Batch-level summary. Per-nonce warnings would flood the log in a 500-nonce round;
     # this line states the shortfall once, in the terms an operator acts on.
     dropped = len(nonces) - len(out)
     short = sum(1 for r in out if poc_decode and max_tokens

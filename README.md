@@ -38,11 +38,11 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `POC_CHAT_LIKE` | on | PoC rows are scheduled like chat: prefill shares the step with decode, no uniform-step isolation. `0` restores uniform-step. With the admission fixes chat-like is faster alone and next to live chat (108 s / 7.7 req/s vs 137 s / 7.1 for PoC 1500 + chat c=256). |
+| `POC_MIXED_BATCH` | on | PoC prefill may share a step with decode rows, as chat is scheduled. `0` restores decode-only steps (a step is either prefill or decode). |
 | `POC_KV_HEADROOM` | `0.01` | fraction of the KV pool kept free when admitting PoC prefills (plus one block per running row). |
 | `POC_FUSED_REFLECT` | `1` | Triton one-pass Householder reflection; `0` restores the four-kernel reference path. |
-| `POC_ROLLING_WINDOW` / `POC_ROLLING_WAVE` | off | client-side rolling admission (window of concurrent nonces, wave size). |
-| `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_CHAT_LIKE`). |
+| `POC_ROLLING_WINDOW` / `POC_ROLLING_REFILL` | off | client-side rolling admission: window of concurrent nonces and how many are admitted together once that many slots free up. |
+| `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_MIXED_BATCH`). |
 | `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
 

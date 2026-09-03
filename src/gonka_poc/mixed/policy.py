@@ -17,11 +17,11 @@ def poc_is_pure_path(poc_params) -> bool:
     return poc_params.max_tokens == 0
 
 
-def poc_chat_like() -> bool:
-    """PoC rows are scheduled like chat: prefill shares the step with decode, no
-    uniform-step isolation. On by default; POC_CHAT_LIKE=0 restores uniform-step.
-    Rationale and measurements: ADR-0016 §5."""
-    v = os.environ.get("POC_CHAT_LIKE", "").strip().lower()
+def poc_mixed_batch() -> bool:
+    """Mixed batches: a PoC prefill may share a step with decode rows, as chat
+    is scheduled. On by default; POC_MIXED_BATCH=0 restores decode-only steps
+    (a step is either prefill or decode). Rationale: ADR-0016 §5."""
+    v = os.environ.get("POC_MIXED_BATCH", "").strip().lower()
     return v not in ("0", "false", "no", "off")
 
 

@@ -62,7 +62,7 @@ def test_headroom_limits_prefills_per_step(monkeypatch):
 
 
 def test_stall_hands_next_step_to_decode(monkeypatch):
-    monkeypatch.setenv("POC_CHAT_LIKE", "0")
+    monkeypatch.setenv("POC_MIXED_BATCH", "0")
     running = [Req(f"p{i}", True, computed=300) for i in range(3)]
     waiting = [Req("w0", True, computed=0)]
     s = make_sched(running=running, waiting=waiting)

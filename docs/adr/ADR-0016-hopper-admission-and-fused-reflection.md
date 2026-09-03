@@ -22,7 +22,7 @@ stall pool dumps, per-phase timers.
 
 ## Decisions
 
-1. **Liveness under uniform-step.** The uniform-step rule (a step never mixes
+1. **Liveness under decode-only steps.** The decode-only rule (a step never mixes
    a PoC prefill with PoC decode rows) held every decode row back while a
    waiting prefill could not be allocated; only decode frees KV, so the engine
    spun forever with 164 running / 60 waiting / pool 99.7%. If a step that
@@ -34,8 +34,8 @@ stall pool dumps, per-phase timers.
    block sizes 256/64/8/4). vLLM reports the smallest group's block size in
    `cache_config.block_size`, so `poc_kv_capacity()` saw a 69k-token pool
    instead of 464k and capped PoC at 134 rows per step; rows beyond the cap
-   starved for the whole cohort (queue order) and then ran alone (445 steps
-   instead of 257 for a cohort of 164). With the clamp removed the engine
+   starved for the whole admitted batch (queue order) and then ran alone (445 steps
+   instead of 257 for a batch of 164). With the clamp removed the engine
    admitted 600 rows and the step (larger than `max_cudagraph_capture_size`)
    ran eager at 133 ms. The cap is therefore
    `min(max_num_seqs, max_cudagraph_capture_size − running_chat_rows)`: the
@@ -53,19 +53,19 @@ stall pool dumps, per-phase timers.
    prefill-only path (fresh inputs, Haar-rotated vector artifact, host copy
    with a sync per row). Such rows now get zero inputs, a cleared mask and no
    metadata.
-5. **Chat-like scheduling is the default; uniform-step stays as `POC_CHAT_LIKE=0`.**
+5. **Mixed batches are the default; decode-only steps stay as `POC_MIXED_BATCH=0` (knob renamed from `POC_CHAT_LIKE` on 2026-09-03).**
    The verdict is identical in both modes (four corpus↔engine combinations,
    0 mismatches at τ=0.05, τ=0 noise 7.1–7.3% in every case). An earlier
-   measurement favoured uniform-step next to live chat, but that number was
+   measurement favoured decode-only steps next to live chat, but that number was
    produced while the admission scan ignored `skipped_waiting`, which let
-   deferred rows bypass the isolation — a half chat-like mode by accident.
+   deferred rows bypass the isolation — half-mixed batches by accident.
    With the scan fixed (review finding, 03.09) the honest comparison is:
-   alone, chat-like 600 in 25.8 s vs 26.4 s, 3000 in 108.1 s vs 110.8 s;
+   alone, mixed batches 600 in 25.8 s vs 26.4 s, 3000 in 108.1 s vs 110.8 s;
    next to live chat (`poc_share=0.5`, chat c=256): PoC 1500 in 108 s and
-   chat 7.7 req/s vs 137 s and 7.1 req/s for uniform-step. The only
-   documented motive for uniform-step in the ported code was cudagraph rungs;
+   chat 7.7 req/s vs 137 s and 7.1 req/s for decode-only steps. The only
+   documented motive for decode-only steps in the ported code was cudagraph rungs;
    on 0.28/V4 a step with a prefill is eager either way, so isolation only
-   stalls the decode rows. Chat-like also keeps PoC structurally closest to
+   stalls the decode rows. Mixed batches also keep PoC structurally closest to
    chat (same step composition, same knobs), which is what a rational miner
    should be tuning for.
 6. **Fused Householder reflection (Triton) instead of `torch.compile`.** The
@@ -84,8 +84,8 @@ stall pool dumps, per-phase timers.
 | 4×H100, sustained (3000 nonces at once) | before | after |
 | --- | ---: | ---: |
 | PoC nonce/s | 12.2 (window 160, hangs above) | 27.7 |
-| R vs chat c=512 | 0.47 | 1.07 (chat-like, all fixes; 0.95 before the fused kernel) |
-| cohort 164 vs chat 164 | 16.3 s vs 10.6 s | 10.2 s vs 10.6 s |
+| R vs chat c=512 | 0.47 | 1.07 (mixed batches, all fixes; 0.95 before the fused kernel) |
+| batch of 164 vs chat 164 | 16.3 s vs 10.6 s | 10.2 s vs 10.6 s |
 | verdict | — | 0 mismatches at τ=0.05 across modes and kernels |
 | 1×B300 FP8, same branch (03.09) | 26.1 nonce/s, R 0.83 (chat c=512 31.3) | 45.7 nonce/s; chat 34.9 at c=512 but 48.1 at c=1024 (GPU 56% → 64%, PoC 87%), so R ≈ 0.95; PoC no longer depends on the context window (46 nonce/s from 100k to 800k); H100→B300 cross-hardware validation 1/154 200 at τ=0.05 |
 

@@ -7,10 +7,10 @@ step holds no PoC request, in which case every method is a no-op and the
 pure-chat path is untouched.
 
 Policy (ported from the 0.20 in-tree branch, ``vllm/poc/mixed_decode.py``):
-  * default is chat-like (``policy.poc_chat_like``): PoC prefill shares the step
-    with decode; ``POC_CHAT_LIKE=0`` restores uniform-step, where chat and PoC
-    share a forward only while BOTH are decoding and either side's prefill runs
-    isolated so the step lands on a captured cudagraph rung;
+  * default is mixed batches (``policy.poc_mixed_batch``): a PoC prefill shares
+    the step with decode; ``POC_MIXED_BATCH=0`` restores decode-only steps: chat
+    and PoC share a forward only while BOTH are decoding, and either side's
+    prefill runs isolated so the step lands on a captured cudagraph rung;
   * ``poc_share`` splits the step's token budget so PoC cannot starve chat;
   * ``poc_max_batch_size`` caps PoC rows per step;
   * a defer valve bounds consecutive chat-prefill defers so chat churn cannot
@@ -25,7 +25,7 @@ from gonka_poc.mixed.policy import (
     poc_alloc_footprint,
     poc_cfg,
     poc_share_budget,
-    poc_chat_like,
+    poc_mixed_batch,
     poc_step_num_tokens,
 )
 from gonka_poc.mixed.runtime import poc_kv_capacity, resolve_poc_max_batch_size
@@ -154,7 +154,7 @@ def _kv_headroom_allow(scheduler):
     """How many PoC prefills fit into this step while leaving headroom in the
     pool: one block per running row (growth this step) plus a POC_KV_HEADROOM
     fraction (default 1%) of the pool. None: vLLM internals unavailable, gate
-    off. Checking the first row alone is not enough: a wave of up to
+    off. Checking the first row alone is not enough: a burst of up to
     MNBT/seq_len prefills in one step overruns any headroom."""
     import os
     try:
@@ -262,7 +262,7 @@ class PoCAdmission:
         # 256/64/8/4 blocks) vLLM puts the smallest group's block size into
         # cache_config.block_size, so the formula undercounts the pool by an
         # order of magnitude and caps PoC well below what actually runs; the
-        # excess rows starve until the cohort ends. Memory admission is already
+        # excess rows starve until the admitted batch ends. Memory admission is already
         # covered by vLLM's full_sequence_must_fit plus the livelock guard below,
         # so the KV clamp is skipped under hybrid KV.
         kv_groups = getattr(getattr(getattr(scheduler, "kv_cache_manager", None),
@@ -314,7 +314,7 @@ class PoCAdmission:
 
         # Liveness. If the previous step announced a PoC prefill but scheduled
         # NO rows at all — waiting rows lacked KV and decode rows were held for
-        # uniform-step — the engine spins forever: only decode frees memory and
+        # decode-only steps — the engine spins forever: only decode frees memory and
         # decode waits for the prefill. So the step goes to decode (waiting rows
         # held, step stays uniform). Prefill is retried once any row finishes
         # (running shrank) or every STALL_RETRY_STEPS.
@@ -327,8 +327,8 @@ class PoCAdmission:
         if poc_will_prefill:
             self._prefill_allow = _kv_headroom_allow(scheduler)
             # POC_PREFILL_PER_STEP=k: at most k new PoC prefills per step. Useful
-            # in chat-like mode: a small prefill slice inside a decode step keeps
-            # the step within the graph size instead of a 16k-token eager wave.
+            # with mixed batches: a small prefill slice inside a decode step keeps
+            # the step within the graph size instead of a 16k-token eager step.
             k = _prefill_per_step()
             if k > 0:
                 self._prefill_allow = k if self._prefill_allow is None \
@@ -366,7 +366,7 @@ class PoCAdmission:
         # decode before its prefill output has landed. The async scheduler keeps
         # a queue of depth 1: step N output is processed by step N+2. A delay of
         # exactly one step closes the race. With rolling admission the
-        # prefill->decode seam happens on every wave, so this is mandatory.
+        # prefill->decode seam happens on every refill, so this is mandatory.
         self._scheduler = scheduler
         self._prefill_landing = getattr(scheduler, "_poc_prefill_landing", None) or set()
         scheduler._poc_prefill_landing = set()
@@ -377,8 +377,8 @@ class PoCAdmission:
         self._poc_prefill = poc_will_prefill
         self._defer_chat, self._defer_poc, scheduler._poc_defers = (
             decode_only_mixing_gate(
-                # Chat-like: no prefill isolation (the gate's original behaviour).
-                mixed_cudagraph=not poc_chat_like(),
+                # Mixed batches: no prefill isolation (the gate's original behaviour).
+                mixed_cudagraph=not poc_mixed_batch(),
                 poc_decode_pending=poc_decode_pending,
                 poc_will_prefill=poc_will_prefill,
                 chat_will_prefill=chat_will_prefill,
@@ -396,7 +396,7 @@ class PoCAdmission:
         if self._defer_poc or self._scheduled >= self._max_batch:
             return True
         # Step given to decode after a stalled prefill: waiting rows wait until
-        # decode frees KV (step stays uniform).
+        # decode frees KV (step stays decode-only).
         if request.num_computed_tokens == 0 and (
                 self._stalled or (self._prefill_allow is not None
                                   and self._new_prefills >= self._prefill_allow)):
@@ -404,9 +404,9 @@ class PoCAdmission:
         # This row's prefill landed last step; its output is still in flight.
         if getattr(request, "request_id", None) in self._prefill_landing:
             return True
-        # Chat-like: PoC prefill and decode rows share the step. Otherwise
-        # uniform-step (a pure decode step lands on a captured CUDA graph).
-        if poc_chat_like():
+        # Mixed batches: PoC prefill and decode rows share the step. Otherwise
+        # decode-only steps (a pure decode step lands on a captured CUDA graph).
+        if poc_mixed_batch():
             return False
         # Keep a step uniform: never mix a PoC prefill with PoC decode rows.
         return self._poc_prefill and request.num_computed_tokens > 0

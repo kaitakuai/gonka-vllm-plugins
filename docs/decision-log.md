@@ -7,11 +7,11 @@ made it. Full rationale lives in `docs/adr/`.
 
 R on 4×H100 (DeepSeek-V4, vLLM 0.28) went from 0.47 to 1.07 without touching
 kernels, TP or the PoC math. The hang above ~160 nonces was a livelock of the
-uniform-step rule; the low R was a per-step cap of 134 rows computed from a KV
+decode-only-step rule; the low R was a per-step cap of 134 rows computed from a KV
 formula that misreads hybrid KV block sizes. Six admission defects fixed, one
-Triton kernel added. Chat-like scheduling became the default on 03.09 (the
-earlier uniform-step advantage next to live chat came from an admission scan
-that bypassed the isolation); `POC_CHAT_LIKE=0` restores uniform-step. Verdict unchanged in every
+Triton kernel added. Mixed batches became the default on 03.09 (the
+earlier decode-only-step advantage next to live chat came from an admission scan
+that bypassed the isolation); `POC_MIXED_BATCH=0` (renamed from `POC_CHAT_LIKE` on 2026-09-03) restores decode-only steps. Verdict unchanged in every
 corpus↔engine combination (0 at τ=0.05).
 
 Pseudo token ids for hash-MoE stay and are always on; token-id-routed models

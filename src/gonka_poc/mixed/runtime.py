@@ -456,7 +456,7 @@ def build_unified_mixed_batch_inputs(
                 offset += 1
             elif (poc_params.max_tokens > 0
                   and req_state.num_computed_tokens >= seq_len):
-                # Ghost: the decode row was already emitted and freed (st is None),
+                # Stale row: already emitted and freed (st is None),
                 # but the async scheduler gave it one more step. Otherwise it would
                 # take the prefill path (generate_inputs + host-sync per row).
                 # No output needed: zeros, mask False, no metadata.
