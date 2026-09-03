@@ -3,6 +3,27 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-03 — vLLM 0.25.1 is the release line; Hopper TP>1 needs `--no-async-scheduling`
+
+The release targets vLLM 0.25.1 only (Vlad's request), so the branch pair
+`mixed-poc-vllm-0.25.1-dev` (residual 4ebecc816 + this plugin) was verified on it.
+1×B300: PoC 27–28 nonce/s at GPU 92–95%, chat 25.3 req/s (c=512), R 1.08; corpora
+produced on 0.28 validate on 0.25.1 with 0 mismatches at τ=0.05; REAP fraud arm
+3.4% vs honest background ≤0.02%; NVFP4 boots (FLASHINFER_TRTLLM) but its prover is
+non-deterministic at ~0.01%. Mixed batches stay the default (decode-only steps cut
+chat from 13.4 to 5.0 req/s next to PoC).
+
+4×H100 (TP=4) on 0.25.1 crashes the engine (`illegal instruction`) once a PoC
+batch exceeds ~64 nonces, regardless of every plugin knob (mixed/decode-only,
+fused reflect, prefill slicing, ablated math), CUDA graph mode, stream and
+collective settings. Chat of the same shape does not crash; 0.28 does not crash.
+Root cause not located. Deploy Hopper TP>1 nodes on 0.25.1 with
+`--no-async-scheduling` (vLLM flag, node config): PoC 20.4 nonce/s at GPU 76%,
+chat 21.9 req/s, R 0.93 (vs 27.9 / 28.3 / 0.99 on 0.28 with async scheduling);
+cross-version and self validation stay at 0 mismatches (τ=0.05), but PoC next to
+live chat degrades most (PoC 1500 in 151 s with chat at 4.7 req/s, vs 102 s and
+8.3 req/s on 0.28).
+
 ## 2026-09-02 — Hopper decode-PoC: admission defects fixed, fused reflection
 
 R on 4×H100 (DeepSeek-V4, vLLM 0.28) went from 0.47 to 1.07 without touching

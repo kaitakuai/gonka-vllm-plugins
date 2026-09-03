@@ -34,6 +34,14 @@ vllm serve <model>
 Boot log confirms: `PoC implementation: gonka_poc... (plugin)`.
 PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
+## Known issues
+
+- **vLLM 0.25.1, Hopper, TP>1** (4×H100, DeepSeek-V4): a PoC batch above ~64 nonces
+  crashes the engine with a sticky `illegal instruction` under asynchronous
+  scheduling; chat of the same shape does not, and 0.28 does not. Boot such nodes
+  with `--no-async-scheduling` (≈ −30% on both PoC and chat, R unchanged within
+  noise). Details: `docs/decision-log.md` (2026-09-03).
+
 ## Runtime knobs (plugin-side, environment of the server)
 
 | variable | default | meaning |
