@@ -84,7 +84,7 @@ stall pool dumps, per-phase timers.
 | 4×H100, sustained (3000 nonces at once) | before | after |
 | --- | ---: | ---: |
 | PoC nonce/s | 12.2 (window 160, hangs above) | 27.7 |
-| R vs chat c=512 | 0.47 | 1.07 (mixed batches, all fixes; 0.95 before the fused kernel) |
+| R vs chat c=512 | 0.47 | 0.99 (03.09, same boot: PoC 27.9 nonce/s vs chat 28.3 req/s; the earlier 1.07 used the 02.09 chat baseline of 25.9 req/s on the previous host, chat on H100 is host-bound at GPU ~58%; 0.95 before the fused kernel) |
 | batch of 164 vs chat 164 | 16.3 s vs 10.6 s | 10.2 s vs 10.6 s |
 | verdict | — | 0 mismatches at τ=0.05 across modes and kernels |
 | 1×B300 FP8, same branch (03.09) | 26.1 nonce/s, R 0.83 (chat c=512 31.3) | 45.7 nonce/s; chat 34.9 at c=512 but 48.1 at c=1024 (GPU 56% → 64%, PoC 87%), so R ≈ 0.95; PoC no longer depends on the context window (46 nonce/s from 100k to 800k); H100→B300 cross-hardware validation 1/154 200 at τ=0.05 |
