@@ -7,9 +7,10 @@ step holds no PoC request, in which case every method is a no-op and the
 pure-chat path is untouched.
 
 Policy (ported from the 0.20 in-tree branch, ``vllm/poc/mixed_decode.py``):
-  * chat and PoC share a forward only while BOTH are decoding; either side's
-    prefill runs isolated, so a mixed step stays uniform-decode shaped and lands
-    on a captured cudagraph rung;
+  * default is chat-like (``policy.poc_chat_like``): PoC prefill shares the step
+    with decode; ``POC_CHAT_LIKE=0`` restores uniform-step, where chat and PoC
+    share a forward only while BOTH are decoding and either side's prefill runs
+    isolated so the step lands on a captured cudagraph rung;
   * ``poc_share`` splits the step's token budget so PoC cannot starve chat;
   * ``poc_max_batch_size`` caps PoC rows per step;
   * a defer valve bounds consecutive chat-prefill defers so chat churn cannot
@@ -195,9 +196,8 @@ class PoCAdmission:
     STALL_RETRY_STEPS = 16
 
     def __init__(self, scheduler, token_budget: int) -> None:
-        # skipped_waiting: строки, отложенные skip() в прошлом шаге, в 0.28 лежат
-        # в отдельной очереди и планируются первыми (FCFS). Без них скан не видит
-        # ожидающий PoC-префилл или чат-префилл и снимает все гейты (ревью 03.09).
+        # skipped_waiting: строки, отложенные skip() в прошлом шаге; без них
+        # скан не видит ожидающий префилл и снимает гейты.
         queues = (scheduler.running, scheduler.waiting,
                   getattr(scheduler, "skipped_waiting", None) or ())
         # ONE pass for all four flags. As four separate any() calls, the ones whose

@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Слитое отражение Хаусхолдера (Triton): y = x - 2*(x·v)*v на строках с маской,
-иначе y = x. Один проход по строке вместо четырёх ядер (`mul`, `sum`, `sub`,
-`where`) эталонной реализации `_reflect_torch`.
+"""Слитое отражение Хаусхолдера (Triton): y = x - 2*(x·v)*v на строках под
+маской, иначе y = x. Эквивалент `_reflect_torch` из native.py.
 
-Это математика консенсуса, поэтому точки округления повторяют эталон:
-произведение x*v округляется до bf16 (как результат torch.mul), сумма копится в
-fp32 (как torch.sum над bf16) и округляется до bf16, дальше 2*dot, *v и x-…
-округляются до bf16 по шагу. Отличается только порядок суммирования в
-редукции (дерево внутри блока против torch), то есть последние биты dot.
-Ядро статично по форме и захватывается в CUDA-граф; первый вызов компилирует
-его, поэтому `warmup()` вызывается при attach, до захвата графов.
+Математика консенсуса: точки округления bf16 повторяют эталон; отличается
+только порядок суммирования dot внутри блока (последние биты). Ядро статично
+по форме и захватывается в CUDA-граф, поэтому компилируется в `warmup()` до
+захвата.
 """
 from __future__ import annotations
 
@@ -69,12 +65,9 @@ def reflect_fused(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch
     Возвращает новый тензор формы x (как torch.where в эталоне)."""
     n = x.shape[0]
     hidden = x.shape[-1]
-    xc = x if x.is_contiguous() else x.contiguous()
-    x2 = xc.view(-1, hidden)
-    copies = x2.shape[0] // max(n, 1) if n else 1
-    v2 = v.reshape(n, hidden)
-    if not v2.is_contiguous():
-        v2 = v2.contiguous()
+    x2 = x.contiguous().view(-1, hidden)
+    copies = x2.shape[0] // n if n else 1
+    v2 = v.reshape(n, hidden).contiguous()
     m8 = mask.reshape(n).to(torch.uint8)
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(hidden)

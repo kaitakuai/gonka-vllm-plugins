@@ -22,10 +22,7 @@ logger = logging.getLogger(__name__)
 
 _SALT_DECODE_EMBED = 0x0D
 _SALT_DECODE_PICK = 0x91
-# Token ids for architectures that route by token id (DeepSeek-V4 hash-MoE reads
-# tid2eid[input_ids] in its first num_hash_layers). Its own stream, so the ids
-# stay uncorrelated with the embed and dim-pick streams derived from the same base.
-_SALT_DECODE_TOKEN_ID = 0x57
+_SALT_DECODE_TOKEN_ID = 0x57  # pseudo token ids, see decode_pseudo_token_ids
 _MIX_A = 0x9E3779B1  # golden-ratio odd constant
 _MIX_B = 0x85EBCA77
 
@@ -155,22 +152,11 @@ def random_pick_indices_gpu(
     return chosen.to(torch.int64)
 
 
-# Offset of the forced ladder. The router adds ``e_score_correction_bias``
-# AFTER scoring, so a bias spread wider than the ladder's floor can lift an
-# unforced expert above a forced one and the verdict stops being a property of
-# the seed. The floor is ``scoring_func(lowest forced logit)`` and therefore
-# model-dependent: sigmoid(1)=0.7311, sqrtsoftplus(1)=1.1460.
-#
-# DeepSeek-V4-Flash-0731 has 7 of 43 router-bias tensors wider than 1.1460, the
-# widest 1.6880 (layer 23), so a ladder based at 1 does not hold there. Basing
-# it at 101 puts the floor at sqrtsoftplus(101) = 10.05 — an order of magnitude
-# above the widest spread we have measured on any checkpoint, which also covers
-# Kimi-K2 (0.7832), the model this gate first closed.
-#
-# Side effect, deliberate: the scored weights of the chosen run become nearly
-# uniform (sqrtsoftplus(101..106) spans 10.05..10.30, a 2.5% spread against
-# 114% for the 1..6 ladder). The seeded set stays exactly the same — only how
-# evenly the run is weighted changes.
+# Ladder offset. The router adds ``e_score_correction_bias`` after scoring, so
+# the ladder floor ``scoring_func(LADDER_BASE + 1)`` must exceed any bias spread,
+# otherwise an unforced expert can outvote a forced one. sqrtsoftplus(101) ~= 10
+# is an order of magnitude above every router bias measured (see ADR). The
+# seeded set is unchanged; only the run's weights flatten.
 LADDER_BASE = 100
 
 
@@ -201,30 +187,19 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     return logits
 
 
-def decode_pseudo_token_ids(base_seeds: torch.Tensor, step, prev_k: torch.Tensor,
-                           vocab: int) -> torch.Tensor:
-    """Per-step pseudo token ids for token-id-dependent architectures.
+def decode_pseudo_token_ids(base_seeds: torch.Tensor, step: int | torch.Tensor,
+                           prev_k: torch.Tensor, vocab: int) -> torch.Tensor:
+    """Per-step pseudo token ids for architectures that route by token id
+    (DeepSeek-V4 hash-MoE, ``tid2eid[input_ids]``): a constant id there would
+    pin those layers to one expert set for every nonce and step.
 
-    DeepSeek-V4's first ``num_hash_layers`` layers route through
-    ``tid2eid[input_ids]`` — by TOKEN ID, not by router logits — so the seeded
-    forcing never reaches them. Feeding a constant there (the engine hands PoC
-    rows ``[0] * seq_len``) makes those layers execute one fixed expert set for
-    every nonce and every step: they attest 6 of 256 experts instead of all of
-    them, and the rest of that layer's weights are never exercised by PoC.
-
-    Derived from the SAME (base, step, prev_k) chain as the decode embeds, under
-    its own salt, so the ids are a function of the nonce trajectory and identical
-    on prover and validator by construction. Integer-only, on device, no host
-    sync — the decode chain's efficiency contract.
-
-    Mirrors :func:`derive_pseudo_input_ids`, which does the same job for the
-    prefill scheme; this is its decode-step counterpart.
+    Same (base, step, prev_k) chain as the decode embeds under its own salt,
+    integer-only on device. Decode counterpart of :func:`derive_pseudo_input_ids`.
     """
     seeds = _step_seeds(base_seeds, step, prev_k, _SALT_DECODE_TOKEN_ID)
     keys = torch.zeros_like(seeds, dtype=torch.int32).view(-1, 1)
     return (_batched_murmur3_32(keys, seeds.view(-1, 1)) % vocab).to(
         torch.int32).flatten()
-
 
 
 def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
@@ -305,10 +280,8 @@ def random_pick_indices_decode_steps(
     steps: List[int],
 ) -> torch.Tensor:
     """Те же индексы, что random_pick_indices_decode(..., [nonce], step=s) для
-    каждого s из steps, но одной пачкой [len(steps), k]: одна строка сидов на
-    шаг, один murmur и один topk. Для эмиссии траектории (257 шагов на строку):
-    257 отдельных вызовов стоили ~15 мс на строку хоста, пачка — ~1 мс.
-    Семантика вызова с prev_point_ids не воспроизводится (в эмиссии не нужна)."""
+    каждого s из steps, одной пачкой [len(steps), k] (один murmur, один topk —
+    для эмиссии траектории). Вариант с prev_point_ids не поддерживается."""
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
     seeds = [_seed_from_string(

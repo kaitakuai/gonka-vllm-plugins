@@ -1,9 +1,10 @@
-import os
 # SPDX-License-Identifier: Apache-2.0
 """Pure mixing-policy functions, ported VERBATIM from Ilya Slavutin's in-tree
 port (axeltec-software/vllm @ poc-decode-0.25, vllm/poc/mixed_decode.py).
 Kept pure/unit-testable exactly as authored; only the import home changed.
 """
+
+import os
 
 # Bound on consecutive chat-prefill defers before a decoding PoC is forced an
 # exclusive step (fairness valve — keeps PoC from starving under chat churn).
@@ -17,18 +18,11 @@ def poc_is_pure_path(poc_params) -> bool:
 
 
 def poc_chat_like() -> bool:
-    """Умолчание с 03.09.2026 — как чат: префилл и декод PoC-строк делят шаг,
-    чужие префиллы не изолируются, посадка по мере освобождения памяти.
-    POC_CHAT_LIKE=0 возвращает uniform-step (изоляция PoC-префиллов ради
-    полного CUDA-графа). Замер 4×H100/0.28/V4 после фиксов допуска: один PoC
-    как-чат быстрее на ~2–5%, рядом с живым чатом (poc_share 0.5, c=256)
-    как-чат 108 с / 7,7 з/с против 137 с / 7,1 у uniform-step. Для V4 шаг с
-    префиллом всё равно eager (breakable-графы), так что изоляция графу не
-    помогает, а декод в это время стоит."""
+    """PoC-строки планируются как чат: префилл делит шаг с декодом, без
+    uniform-step-изоляции. Включено по умолчанию; POC_CHAT_LIKE=0 возвращает
+    uniform-step. Обоснование и замеры — ADR-0016 §5."""
     v = os.environ.get("POC_CHAT_LIKE", "").strip().lower()
-    if v in ("0", "false", "no", "off"):
-        return False
-    return True
+    return v not in ("0", "false", "no", "off")
 
 
 def decode_only_mixing_gate(

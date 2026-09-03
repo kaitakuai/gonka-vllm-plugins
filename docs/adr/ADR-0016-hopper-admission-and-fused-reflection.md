@@ -102,6 +102,16 @@ admission gates on a fake scheduler. Vlad's merged branch (`7f77c07`) needs
 `PoCOutput.mismatch_margin_max`; the 0.28 residual carries it since
 `b3ad15a` (kaitakuai/vllm `mixed-poc-vllm-0.28.0-dev`).
 
+Hash-MoE follow-up (03.09, with Vlad): dropping the seeded pseudo token ids
+and the natural hash gates gave the same verdict against the REAP fraud (all
+three schemes 3.4–3.5% at τ=0.05, floor 0), but without pseudo ids every PoC
+token hits row 0 of `tid2eid`: the three hash layers then exercise the same 7
+experts and a prover could drop the other 250 per layer unnoticed. Decision:
+pseudo token ids are always on (harmless where nothing reads them), hash
+gates keep their natural weights, and the models with a token-id table stay
+an explicit allow-list; a model outside it whose gate carries an integer
+table is refused at attach instead of being seeded blindly.
+
 Open: coordinate the admission changes with the in-tree scheduler work
 (PR #3, KV-lease); not measured on NVFP4 or H200; `poc_cudagraph_capture_size`
 (raise capture size to the PoC batch) not applied on 0.28 — the cap follows

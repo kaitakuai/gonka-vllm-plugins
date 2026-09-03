@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 from gonka_poc.poc.gpu_random import (generate_householder_vector,
                                       _seed_from_string)
-from gonka_poc.poc.decode_random import (expert_logits_from_base, route_base_seed,
+from gonka_poc.poc.decode_random import (decode_pseudo_token_ids,
+                                         expert_logits_from_base, route_base_seed,
                                          pinned_to_device)
 
 # Debug-only TP guard (VLLM_POC_DEBUG_TP=1): PoC reflection vectors / embeds are
@@ -166,9 +167,9 @@ class PoCEmbeddingWrapper(nn.Module):
         self.hidden_size = hidden_size
         self.register_buffer("poc_embeds", embeds, persistent=False)
         self.register_buffer("poc_mask", mask, persistent=False)
+        self.register_buffer("poc_token_ids", poc_token_ids, persistent=False)
         # SYNTH = EMBEDDING (in-graph): synth the decode input from the chain buffers.
         self._synth = embed_base is not None
-        self.register_buffer("poc_token_ids", poc_token_ids, persistent=False)
         if self._synth:
             self.register_buffer("embed_base", embed_base, persistent=False)
             self.register_buffer("embed_prev_k", embed_prev_k, persistent=False)
@@ -182,14 +183,8 @@ class PoCEmbeddingWrapper(nn.Module):
         # Force masked (PoC) rows to a valid in-vocab id (0); their value is unused.
         n = input_ids.shape[0]
         m_rows = self.poc_mask[:n]
-        # On-device substitution (no host sync): masked rows -> the PoC row's own
-        # id, chat rows unchanged. Historically this wrote a constant 0, which is
-        # all an embedding gather needs (the result is discarded below). But the
-        # id ALSO reaches the model's MoE layers, and DeepSeek-V4 routes its first
-        # num_hash_layers through tid2eid[input_ids]: a constant pins those layers
-        # to one expert set for every nonce and every step. poc_token_ids holds a
-        # seeded id per row when the architecture needs one, and stays all-zero
-        # otherwise -- so models that do not route by token id are unchanged.
+        # PoC-строки: poc_token_ids (сидированный id на hash-MoE, иначе нули —
+        # id доходит до MoE-роутера по tid2eid, см. _TOKEN_ID_ROUTED_MODELS).
         input_ids = torch.where(m_rows, self.poc_token_ids[:n].to(input_ids.dtype),
                                 input_ids)
         out = self._inner_call(input_ids)
@@ -253,13 +248,12 @@ def _experts_meta(experts) -> tuple:
     n_group=topk_group=1 (the grouped formula degenerates away). A
     gate+experts module we cannot read is a HARD error — a silently unseeded
     router re-opens the MoE honest-floor hole."""
-    if hasattr(experts, "top_k") and hasattr(experts, "global_num_experts"):
-        return int(experts.global_num_experts), int(experts.top_k)
-    # DeepSeek V4 MegaMoE (deep_gemm_mega_moe) names the global count
-    # ``num_experts``; ``num_local_experts`` is the EP shard, not what the
-    # router scores over.
-    if hasattr(experts, "top_k") and hasattr(experts, "num_experts"):
-        return int(experts.num_experts), int(experts.top_k)
+    # FusedMoE: global_num_experts; DeepSeek-V4 MegaMoE: num_experts
+    # (num_local_experts — EP-шард, роутер по нему не считает).
+    n_global = getattr(experts, "global_num_experts",
+                       getattr(experts, "num_experts", None))
+    if hasattr(experts, "top_k") and n_global is not None:
+        return int(n_global), int(experts.top_k)
     cfg = getattr(experts, "moe_config", None)
     if cfg is not None:
         return int(cfg.num_experts), int(cfg.experts_per_token)
@@ -424,10 +418,8 @@ class PoCNativeState:
         self.embed_base = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.embed_prev_k = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self.embed_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
-        # Pseudo token ids for token-id-routed architectures (DeepSeek-V4 hash-MoE).
-        # vocab==0 means "this model does not route by token id" and the wrapper
-        # keeps the historical constant 0 -- so every other architecture, MiniMax
-        # included, is byte-identical to before this buffer existed.
+        # Псевдо-номера токенов для hash-MoE; token_id_vocab==0 — модель не
+        # роутит по id, буфер остаётся нулевым (attach_native_poc включает).
         self.token_id_vocab = 0
         self.poc_token_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         # PoC-as-a-sampler, part 2: SNAP = SAMPLING. A wrapper on the final norm snaps
@@ -466,20 +458,14 @@ class PoCNativeState:
         self.embed_prev_k.index_copy_(0, offs, prev_k)
         self.embed_step.index_copy_(0, offs, step)
         if self.token_id_vocab:
-            from gonka_poc.poc.decode_random import decode_pseudo_token_ids
             self.poc_token_ids.index_copy_(
                 0, offs, decode_pseudo_token_ids(
                     base, step, prev_k, self.token_id_vocab))
 
     def set_prefill_token_ids(self, offs: torch.Tensor, ids: torch.Tensor) -> None:
-        """Publish pseudo token ids for the PREFILL rows of a decode-PoC nonce.
-
-        The prefill phase carries seq_len positions per nonce, so it is where most
-        of the tid2eid coverage comes from -- an order of magnitude more distinct
-        ids than the one-per-step decode path. No-op unless the architecture
-        routes by token id."""
-        if self.token_id_vocab:
-            self.poc_token_ids.index_copy_(0, offs, ids.to(torch.int32))
+        """Псевдо-номера токенов для префилл-строк нонса (только hash-MoE;
+        вызывающий гейтится по token_id_vocab)."""
+        self.poc_token_ids.index_copy_(0, offs, ids.to(torch.int32))
 
     # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
     # nonce), so a 128-nonce round is ~128 entries. Entries are stored in the
@@ -652,13 +638,21 @@ class PoCNativeState:
             self.mask[:n].copy_(row_mask)
 
 
-# Architectures whose MoE routes by TOKEN ID rather than by router logits, and
-# therefore need seeded pseudo ids instead of the constant the engine hands PoC
-# rows. Keyed by HF ``model_type``. Anything absent keeps ids at 0 and is
-# byte-identical to the behaviour before pseudo ids existed -- that is the
-# property that lets MiniMax goldens stay valid. The prefill scheme gates the
-# same way (see poc_model_runner._generate_poc_input_ids).
+# Архитектуры, у которых MoE-гейт выбирает экспертов по номеру токена (таблица
+# на гейте, у DeepSeek-V4 — tid2eid). Их гейты остаются с натуральными весами;
+# псевдо-номера токенов включены для всех моделей. Модель вне списка с такой
+# таблицей отвергается при attach — список расширяется только после проверки.
 _TOKEN_ID_ROUTED_MODELS = ("deepseek_v4",)
+
+
+def _token_id_table(gate) -> torch.Tensor | None:
+    """Целочисленная 2-D таблица на гейте (у DeepSeek-V4 — tid2eid[vocab, k]):
+    признак маршрутизации по номеру токена. Float-параметры гейта (веса,
+    e_score_correction_bias) под признак не попадают."""
+    for _, t in list(gate.named_parameters(recurse=False)) + list(gate.named_buffers(recurse=False)):
+        if t is not None and t.dim() == 2 and t.dtype in (torch.int32, torch.int64):
+            return t
+    return None
 
 
 _ABLATE = frozenset(x.strip() for x in os.environ.get("POC_ABLATE", "").lower().split(",") if x.strip())
@@ -692,24 +686,20 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         os.environ["POC_FUSED_REFLECT"] = "0"
         _fused = False
     logger.info("PoC reflect: %s", "слитое Triton-ядро" if _fused else "эталон (4 ядра)")
-    if (getattr(hf_config, "model_type", None) in _TOKEN_ID_ROUTED_MODELS
-            and not _ablated("pseudo")):
-        state.token_id_vocab = int(hf_config.vocab_size)
-        logger.info("PoC pseudo token ids ON (model_type=%s, vocab=%d): "
-                    "hash-MoE layers route by token id",
-                    hf_config.model_type, state.token_id_vocab)
+    vocab = int(getattr(hf_config, "vocab_size", 0) or 0)
+    if vocab and not _ablated("pseudo"):
+        state.token_id_vocab = vocab
+        logger.info("PoC pseudo token ids ON (vocab=%d)", vocab)
     # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
     # ahead of time and resolves parameters by qualified name, so re-parenting a
     # layer under a wrapper breaks the compiled graph's parameter map.
     if _ABLATE:
-        logger.warning("POC_ABLATE=%s: диагностический режим, артефакты НЕ консенсусные; "
-                       "выключено: %s", ",".join(sorted(_ABLATE)),
-                       ", ".join(p for p in ("reflect", "router", "pseudo") if _ablated(p)))
-    if _ablated("reflect"):
-        logger.warning("POC_ABLATE=reflect: отражения Хаусхолдера ОТКЛЮЧЕНЫ — диагностика, не консенсус")
-    for i, layer in enumerate(layers if not _ablated("reflect") else []):
-        _install_poc_patch(
-            layer, PoCLayerWrapper(layer, state.vectors[i], state.mask))
+        logger.warning("POC_ABLATE=%s: диагностический режим, артефакты НЕ консенсусные",
+                       ",".join(sorted(_ABLATE)))
+    if not _ablated("reflect"):
+        for i, layer in enumerate(layers):
+            _install_poc_patch(
+                layer, PoCLayerWrapper(layer, state.vectors[i], state.mask))
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
         # Patch forward IN PLACE, never replace the module: wrapping renames
         # parameters (embed_tokens.weight -> embed_tokens.inner.weight) and
@@ -740,18 +730,16 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
             None)
         if moe is None:
             continue
-        if getattr(moe.gate, "tid2eid", None) is not None:
-            # Hash-MoE gate (DeepSeek-V4's first num_hash_layers): expert SELECTION
-            # comes from tid2eid[input_ids] -- already deterministic through the
-            # seeded pseudo token ids -- and the gate logits feed only the WEIGHTS,
-            # gathered at the table's indices (bias unused on this path). Forcing
-            # the ladder here would be worse than useless: the table's experts are
-            # almost never inside the seeded run, so their forced logit is the
-            # floor and sqrt(softplus(-1e4)) = 0 -- the routed experts' output is
-            # multiplied by zero and the layer attests nothing. Keep the natural
-            # logits: selection stays deterministic (table), weights become an
-            # ordinary continuous quantity whose cross-HW drift the snap absorbs,
-            # and the experts' weights actually enter the trajectory.
+        if _token_id_table(moe.gate) is not None:
+            if getattr(hf_config, "model_type", None) not in _TOKEN_ID_ROUTED_MODELS:
+                raise RuntimeError(
+                    f"PoC: MoE gate {type(moe.gate).__name__} routes by token id "
+                    f"(integer table on the gate), but model_type "
+                    f"{getattr(hf_config, 'model_type', None)!r} is not in "
+                    "_TOKEN_ID_ROUTED_MODELS — verify the model, then add it")
+            # Hash-MoE (DeepSeek-V4): выбор экспертов — tid2eid[input_ids], уже
+            # детерминирован псевдо-номерами; логиты дают только веса. Форсинг
+            # лестницы обнулил бы веса табличных экспертов — оставляем натуральные.
             skipped_hash += 1
             continue
         n_exp, top_k = _experts_meta(moe.experts)
@@ -763,7 +751,6 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         state.router_meta.append((n_exp, top_k))
         _gate = moe.gate
         if _ablated("router"):
-            skipped_hash += 0  # сидирование ОТКЛЮЧЕНО (POC_ABLATE=router)
             continue
         _install_poc_patch(_gate, PoCRouterWrapper(
             _gate, route_base, state.route_step, n_exp, top_k, state.mask))

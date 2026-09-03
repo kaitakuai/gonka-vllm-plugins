@@ -14,6 +14,9 @@ earlier uniform-step advantage next to live chat came from an admission scan
 that bypassed the isolation); `POC_CHAT_LIKE=0` restores uniform-step. Verdict unchanged in every
 corpus↔engine combination (0 at τ=0.05).
 
+Pseudo token ids for hash-MoE stay and are always on; token-id-routed models
+remain an explicit allow-list with a loud refusal for unknown ones (03.09).
+
 See [ADR-0016](adr/ADR-0016-hopper-admission-and-fused-reflection.md).
 
 ## 2026-07-24 — First tag cut: `v0.1.0a0`

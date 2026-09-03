@@ -16,6 +16,7 @@ core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Validation
 runs pure.
 """
 import os
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -71,14 +72,13 @@ def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
     import torch
 
     from gonka_poc.poc.data import encode_vector
-    from gonka_poc.poc.decode_random import random_pick_indices_decode
+    from gonka_poc.poc.decode_random import random_pick_indices_decode_steps
     from gonka_poc.poc.sphere import SPHERE_DIM
     if debug:
         return [encode_vector(row) for row in q_host]
-    from gonka_poc.poc.decode_random import random_pick_indices_decode_steps
     cpu = torch.device("cpu")
-    # Одна пачка индексов на всю траекторию (см. random_pick_indices_decode_steps):
-    # побитово те же индексы, что пошаговые вызовы, без 257 сидов/topk на строку.
+    # Индексы всех шагов одной пачкой; побитово равны пошаговым random_pick_indices_decode
+    # (tests/unit/test_pick_indices_steps.py).
     idx_all = random_pick_indices_decode_steps(
         block_hash, public_key, nonce, SPHERE_DIM, k_dim, cpu,
         list(range(len(q_host)))).numpy()
@@ -255,12 +255,10 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     if mgr is None:
         cc = runner.cache_config
         sc = runner.vllm_config.scheduler_config
-        # Слоты состояния не держат KV, поэтому пул сайзится по max_num_seqs
-        # (или явному poc_max_batch_size), а не по формуле ёмкости пула:
-        # под гибридным KV (DeepSeek V4) cache_config.block_size — блок самой
-        # мелкой группы, и poc_kv_capacity занижает пул в десятки раз (02.09.2026).
-        # Строка без слота проваливается в чисто префилловый путь и глушится
-        # на префилле — это тихая потеря нонсов, а не экономия.
+        # Слоты состояния KV не держат: пул — по max_num_seqs (или явному
+        # poc_max_batch_size), без клампа poc_kv_capacity: под гибридным KV
+        # block_size — от самой мелкой группы, и формула занижает пул; строка без
+        # слота молча теряет нонс. KV-кламп остаётся у планировщика (admission.py).
         cap = resolve_poc_max_batch_size(cc.poc_max_batch_size, sc.max_num_seqs, 0)
         logger.info("poc: пул состояний decode-PoC: %d слотов (configured=%d, "
                     "max_num_seqs=%d, num_gpu_blocks=%s, block_size=%s)",
@@ -456,15 +454,12 @@ def build_unified_mixed_batch_inputs(
                     'decode_state': st, 'decode_step': decode_step,
                 })
                 offset += 1
-            elif (st is None and poc_params.max_tokens > 0
+            elif (poc_params.max_tokens > 0
                   and req_state.num_computed_tokens >= seq_len):
-                # Призрак: decode-строка уже завершена и её состояние освобождено
-                # (эмиссия прошла), но асинхронный планировщик успел поставить ей
-                # ещё один шаг до обработки вывода. Раньше она проваливалась в
-                # ветку чисто префиллового PoC: генерация входов, отражения Хаара
-                # и копия на хост с синхронизацией на КАЖДУЮ такую строку — шаг
-                # после завершения 63 строк стоил ~1 с (4×H100, 02.09.2026).
-                # Вывод призрака никому не нужен: нули, маска False, без метаданных.
+                # Призрак: decode-строка уже эмитирована и освобождена (st is None),
+                # но асинхронный планировщик успел дать ей ещё шаг. Иначе она уходит
+                # в префилловый путь (generate_inputs + host-sync на каждую строку).
+                # Выход не нужен: нули, маска False, без метаданных.
                 unified_embeds[offset:offset + num_tokens].zero_()
                 unified_positions[offset:offset + num_tokens] = (
                     chat_positions[offset:offset + num_tokens])
@@ -486,22 +481,19 @@ def build_unified_mixed_batch_inputs(
                     poc_len, device=runner.device, dtype=chat_positions.dtype
                 )
                 poc_position_mask[offset:offset + poc_len] = True
-                # Pseudo token ids for the prefill positions. This is where most
-                # of the tid2eid coverage lives on token-id-routed architectures:
-                # seq_len distinct ids per nonce against one per decode step.
-                # Derived by the SAME function the prefill scheme uses, so the two
-                # schemes agree on what a nonce's ids are. No-op elsewhere.
-                _nat0 = getattr(runner, "_poc_native", None)
-                if _nat0 is not None and getattr(_nat0, "token_id_vocab", 0):
+                # Pseudo token ids for the prefill rows (token-id-routed models only):
+                # same derivation as the prefill scheme, so both schemes see the
+                # same ids for a nonce.
+                native = getattr(runner, "_poc_native", None)
+                if native is not None and getattr(native, "token_id_vocab", 0):
                     from gonka_poc.poc.gpu_random import derive_pseudo_input_ids
-                    _ids = derive_pseudo_input_ids(
-                        poc_params.block_hash, poc_params.public_key,
-                        [poc_params.nonce], poc_len,
-                        _nat0.token_id_vocab, runner.device)
-                    _nat0.set_prefill_token_ids(
+                    native.set_prefill_token_ids(
                         torch.arange(offset, offset + poc_len,
                                      device=runner.device, dtype=torch.long),
-                        _ids)
+                        derive_pseudo_input_ids(
+                            poc_params.block_hash, poc_params.public_key,
+                            [poc_params.nonce], poc_len,
+                            native.token_id_vocab, runner.device))
                 poc_metadata.append({
                     'type': 'poc', 'req_id': req_id, 'start_idx': offset,
                     'length': poc_len, 'poc_params': poc_params,

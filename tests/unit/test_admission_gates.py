@@ -1,8 +1,5 @@
 """Чистая логика допуска PoC на фальшивом планировщике (без GPU и без vLLM-движка)."""
-import os
 import types
-
-import pytest
 
 from gonka_poc.mixed.admission import PoCAdmission
 
@@ -10,16 +7,9 @@ from gonka_poc.mixed.admission import PoCAdmission
 class Req:
     def __init__(self, rid, poc, computed=0, prompt=256):
         self.request_id = rid
-        self.poc_params = types.SimpleNamespace(seq_len=256, max_tokens=256, nonce=int(rid[-1]) if rid[-1].isdigit() else 0) if poc else None
+        self.poc_params = types.SimpleNamespace(seq_len=256, max_tokens=256) if poc else None
         self.num_computed_tokens = computed
         self.num_prompt_tokens = prompt
-
-
-class Pool:
-    def __init__(self, free, total):
-        self._free, self.num_gpu_blocks = free, total
-    def get_num_free_blocks(self):
-        return self._free
 
 
 def make_sched(running=(), waiting=(), skipped=(), free=10000, total=17278, cg=512, groups=2, need=105):
@@ -29,7 +19,7 @@ def make_sched(running=(), waiting=(), skipped=(), free=10000, total=17278, cg=5
                                            poc_seq_len=256, poc_max_tokens=256, poc_share=0.5)
     s.scheduler_config = types.SimpleNamespace(max_num_seqs=1024)
     s.kv_cache_manager = types.SimpleNamespace(
-        block_pool=Pool(free, total),
+        block_pool=types.SimpleNamespace(get_num_free_blocks=lambda: free, num_gpu_blocks=total),
         kv_cache_config=types.SimpleNamespace(kv_cache_groups=[object()] * groups),
         watermark_blocks=0)
     s.vllm_config = types.SimpleNamespace(compilation_config=types.SimpleNamespace(max_cudagraph_capture_size=cg))
@@ -40,8 +30,7 @@ def make_sched(running=(), waiting=(), skipped=(), free=10000, total=17278, cg=5
     return s
 
 
-def test_cap_is_cudagraph_minus_chat_rows(monkeypatch):
-    monkeypatch.setenv("POC_CHAT_LIKE", "0")
+def test_cap_is_cudagraph_minus_chat_rows():
     chat = [Req(f"c{i}", False, computed=300) for i in range(256)]
     poc = [Req(f"p{i}", True, computed=300) for i in range(10)]
     a = PoCAdmission(make_sched(running=chat + poc), token_budget=16384)
@@ -76,7 +65,7 @@ def test_stall_hands_next_step_to_decode(monkeypatch):
     monkeypatch.setenv("POC_CHAT_LIKE", "0")
     running = [Req(f"p{i}", True, computed=300) for i in range(3)]
     waiting = [Req("w0", True, computed=0)]
-    s = make_sched(running=running, waiting=waiting, free=10000)
+    s = make_sched(running=running, waiting=waiting)
     a = PoCAdmission(s, token_budget=16384)
     assert a._poc_prefill and all(a.skip(r) for r in running)   # uniform-step держит декод
     # шаг ничего не запланировал → следующий шаг отдаётся декоду
@@ -96,8 +85,7 @@ def test_prefill_per_step_knob(monkeypatch):
     assert n == 2
 
 
-def test_step_budget_guard_refuses_partial_prefill(monkeypatch):
-    monkeypatch.setenv("POC_CHAT_LIKE", "1")
+def test_step_budget_guard_refuses_partial_prefill():
     chat = [Req("c0", False, computed=0, prompt=16300)]
     w = Req("w0", True, computed=0)
     a = PoCAdmission(make_sched(running=chat, waiting=[w], free=100000), token_budget=16384)
@@ -108,8 +96,7 @@ def test_step_budget_guard_refuses_partial_prefill(monkeypatch):
     assert not b.over_budget(w, 256)
 
 
-def test_skipped_waiting_is_scanned(monkeypatch):
-    monkeypatch.setenv("POC_CHAT_LIKE", "0")
+def test_skipped_waiting_is_scanned():
     running = [Req("p0", True, computed=300)]
     skipped = [Req("w0", True, computed=0)]
     a = PoCAdmission(make_sched(running=running, skipped=skipped, free=100000), token_budget=16384)
