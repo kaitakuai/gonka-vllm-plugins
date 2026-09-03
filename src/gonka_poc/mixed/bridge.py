@@ -120,7 +120,7 @@ class PoCRunnerBridge:
             mixed_decode.setup_decode_poc(self.runner, poc_requests)
             torch.cuda.synchronize(); _dt = (time.monotonic() - _t0) * 1000
             if _dt > 30:
-                logger.info("poc: pre_step setup_decode_poc %.0f мс (rows=%d, new=%d)",
+                logger.info("poc: pre_step setup_decode_poc %.0f ms (rows=%d, new=%d)",
                             _dt, len(poc_requests), len(scheduler_output.scheduled_new_reqs))
         else:
             mixed_decode.setup_decode_poc(self.runner, poc_requests)
@@ -197,8 +197,8 @@ class PoCRunnerBridge:
                     tot = (_t3 - _t0) * 1000
                     if tot > 50:
                         n_pre = sum(1 for m in metadata if m.get("length", 1) > 1)
-                        logger.info("poc: pre_forward %.0f мс (build=%.0f, hashes=%.0f, "
-                                    "routing=%.0f; rows=%d, prefill_rows=%d)",
+                        logger.info("poc: pre_forward %.0f ms (build=%.0f, hashes=%.0f,"
+                                    " routing=%.0f; rows=%d, prefill_rows=%d)",
                                     tot, (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
                                     (_t3 - _t2) * 1000, n_rows, n_pre)
 
@@ -216,7 +216,7 @@ class PoCRunnerBridge:
             gpu_ms = self._diag_ev0.elapsed_time(ev1)
             host_ms = (time.monotonic() - self._diag_host0) * 1000
             if gpu_ms > 150 or host_ms > 150:
-                logger.info("poc: форвард gpu=%.0f мс host=%.0f мс, tokens=%d, poc_rows=%d",
+                logger.info("poc: fwd gpu=%.0f ms host=%.0f ms, tokens=%d, poc_rows=%d",
                             gpu_ms, host_ms, self._diag_tokens,
                             len(self._step.get("poc_metadata") or ()))
             self._diag_ev0 = None

@@ -18,9 +18,9 @@ def poc_is_pure_path(poc_params) -> bool:
 
 
 def poc_chat_like() -> bool:
-    """PoC-строки планируются как чат: префилл делит шаг с декодом, без
-    uniform-step-изоляции. Включено по умолчанию; POC_CHAT_LIKE=0 возвращает
-    uniform-step. Обоснование и замеры — ADR-0016 §5."""
+    """PoC rows are scheduled like chat: prefill shares the step with decode, no
+    uniform-step isolation. On by default; POC_CHAT_LIKE=0 restores uniform-step.
+    Rationale and measurements: ADR-0016 §5."""
     v = os.environ.get("POC_CHAT_LIKE", "").strip().lower()
     return v not in ("0", "false", "no", "off")
 

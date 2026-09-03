@@ -4,7 +4,7 @@ import torch
 from gonka_poc.mixed import reflect_kernel
 from gonka_poc.mixed.native import _reflect, _reflect_torch
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="нужен GPU")
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 
 @cuda
@@ -22,9 +22,9 @@ def test_fused_matches_reference(n, copies, hidden):
     ref = _reflect_torch(x, v.view(n, 1, hidden), mask.view(n, 1, 1))
     got = reflect_kernel.reflect_fused(x, v, mask)
     assert got.shape == x.shape and got.dtype == x.dtype
-    # немаскированные строки — побитово x
+    # unmasked rows: bitwise x
     assert torch.equal(got[~mask], x[~mask])
-    # маскированные — эталон с точностью bf16 (отличие только в порядке суммирования dot)
+    # masked rows: reference to bf16 precision (only the dot summation order differs)
     d = (got.float() - ref.float()).abs()
     tol = 2 * torch.finfo(torch.bfloat16).eps * (ref.float().abs() + 1.0)
     assert bool((d <= tol).all()), f"max |Δ|={d.max().item():.3e}, rel={(d / (ref.float().abs() + 1e-6)).max().item():.3e}"

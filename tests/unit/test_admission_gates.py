@@ -1,4 +1,4 @@
-"""Чистая логика допуска PoC на фальшивом планировщике (без GPU и без vLLM-движка)."""
+"""PoC admission logic on a fake scheduler (no GPU, no vLLM engine)."""
 import types
 
 from gonka_poc.mixed.admission import PoCAdmission
@@ -51,7 +51,7 @@ def test_headroom_limits_prefills_per_step(monkeypatch):
     monkeypatch.setenv("POC_KV_HEADROOM", "0.0")
     running = [Req(f"p{i}", True, computed=300) for i in range(20)]
     waiting = [Req(f"w{i}", True, computed=0) for i in range(5)]
-    # free 340 − reserve 20 = 320 → 3 префилла по 105
+    # free 340 − reserve 20 = 320 → 3 prefills of 105 each
     a = PoCAdmission(make_sched(running=running, waiting=waiting, free=340), token_budget=16384)
     assert a._prefill_allow == 3
     admitted = 0
@@ -67,8 +67,8 @@ def test_stall_hands_next_step_to_decode(monkeypatch):
     waiting = [Req("w0", True, computed=0)]
     s = make_sched(running=running, waiting=waiting)
     a = PoCAdmission(s, token_budget=16384)
-    assert a._poc_prefill and all(a.skip(r) for r in running)   # uniform-step держит декод
-    # шаг ничего не запланировал → следующий шаг отдаётся декоду
+    assert a._poc_prefill and all(a.skip(r) for r in running)  # decode held this step
+    # nothing was scheduled -> the next step goes to decode
     b = PoCAdmission(s, token_budget=16384)
     assert b._stalled and not b._poc_prefill
     assert not any(b.skip(r) for r in running) and b.skip(waiting[0])
@@ -89,9 +89,9 @@ def test_step_budget_guard_refuses_partial_prefill():
     chat = [Req("c0", False, computed=0, prompt=16300)]
     w = Req("w0", True, computed=0)
     a = PoCAdmission(make_sched(running=chat, waiting=[w], free=100000), token_budget=16384)
-    a.note_scheduled(chat[0], 16300)                 # чат съел почти весь шаг
-    assert a.num_tokens(w, 84) == 256                # планировщик сжал до остатка, PoC хочет целиком
-    assert a.over_budget(w, 256)                     # ... и должен быть отвергнут
+    a.note_scheduled(chat[0], 16300)    # chat took nearly the whole step
+    assert a.num_tokens(w, 84) == 256   # scheduler clamps to remainder; PoC wants all
+    assert a.over_budget(w, 256)        # ... so it must be refused
     b = PoCAdmission(make_sched(waiting=[w], free=100000), token_budget=16384)
     assert not b.over_budget(w, 256)
 
@@ -100,4 +100,4 @@ def test_skipped_waiting_is_scanned():
     running = [Req("p0", True, computed=300)]
     skipped = [Req("w0", True, computed=0)]
     a = PoCAdmission(make_sched(running=running, skipped=skipped, free=100000), token_budget=16384)
-    assert a._poc_prefill                            # префилл из skipped_waiting виден
+    assert a._poc_prefill                            # skipped_waiting prefill is seen

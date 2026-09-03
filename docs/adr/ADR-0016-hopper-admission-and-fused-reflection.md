@@ -81,7 +81,7 @@ stall pool dumps, per-phase timers.
 
 ## Consequences
 
-| 4×H100, sustained (banquet 3000) | before | after |
+| 4×H100, sustained (3000 nonces at once) | before | after |
 | --- | ---: | ---: |
 | PoC nonce/s | 12.2 (window 160, hangs above) | 27.7 |
 | R vs chat c=512 | 0.47 | 1.07 (chat-like, all fixes; 0.95 before the fused kernel) |

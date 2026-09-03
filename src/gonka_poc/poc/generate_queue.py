@@ -65,13 +65,12 @@ def _server_gpu() -> str:
 
 
 def _rolling_window(total_nonces: int) -> int:
-    """Размер окна скользящей подачи; 0 = выключено (банкетная подача).
+    """Rolling admission window size; 0 = off (admit everything at once).
 
-    POC_ROLLING_WINDOW: >0 — явное окно; 0/пусто — выключено; "auto" — половина
-    измеренной стены не известна плагину, поэтому auto берёт консервативные 256:
-    заведомо ниже любой измеренной стены decode-PoC (592 на B300, 160 на H100 в
-    кампании D) и достаточно, чтобы держать движок сытым — лестницы показывают
-    насыщение к 256-512.
+    POC_ROLLING_WINDOW: >0 — explicit window; 0/empty — off; "auto" — 256. The
+    plugin does not know the measured KV wall, so auto picks a conservative
+    value: below any measured decode-PoC wall, yet enough to keep the engine
+    fed (ladders saturate around 256-512).
     """
     raw = os.environ.get("POC_ROLLING_WINDOW", "").strip().lower()
     if not raw or raw == "0":
@@ -81,29 +80,29 @@ def _rolling_window(total_nonces: int) -> int:
     try:
         w = int(raw)
     except ValueError:
-        logger.warning("POC_ROLLING_WINDOW=%r не число и не auto — выключаю", raw)
+        logger.warning("POC_ROLLING_WINDOW=%r: not a number or auto, disabling", raw)
         return 0
     return max(0, min(w, total_nonces))
 
 
 def _rolling_wave(window: int) -> int:
-    """Размер волны посадки: POC_ROLLING_WAVE или четверть окна (не меньше 16).
-    Меньше волна — ровнее поток, но чаще префилл-шаги, тормозящие декод;
-    больше — ближе к банкету."""
+    """Wave size: POC_ROLLING_WAVE or a quarter of the window (at least 16).
+    Smaller waves smooth the flow but add prefill steps that stall decode;
+    larger ones approach all-at-once admission."""
     raw = os.environ.get("POC_ROLLING_WAVE", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return min(int(raw), window)
-    # Как чат: посадка по одному нонсу — uniform-step снят, префилл в каждом
-    # шаге декод не останавливает.
+    # Chat-like: admit one nonce at a time. Uniform-step is off there, so a
+    # prefill in every step does not stop decode.
     if os.environ.get("POC_CHAT_LIKE", "").strip() in ("1", "true", "yes"):
         return 1
     return max(16, min(window, window // 4))
 
 
 async def _run_in_waves(compute_one, nonces, window: int, wave: int):
-    """Первые `window` нонсов стартуют разом; далее, накопив `wave` освободившихся
-    мест (или когда в работе никого не осталось), сажает следующую волну целиком.
-    Возвращает результаты в порядке исходного списка."""
+    """The first `window` nonces start together; afterwards, once `wave` slots
+    have freed (or nothing is in flight), the next wave is launched whole.
+    Returns results in the order of the input list."""
     results = [None] * len(nonces)
     pending = list(range(len(nonces)))
     running = {}                      # task -> index
@@ -125,7 +124,7 @@ async def _run_in_waves(compute_one, nonces, window: int, wave: int):
             idx = running.pop(t)
             try:
                 results[idx] = t.result()
-            except Exception as e:   # compute_one сам ловит; это страховка
+            except Exception as e:   # compute_one catches its own; safety net
                 logger.error("PoC rolling: nonce %s raised %r", nonces[idx], e)
                 results[idx] = None
             freed += 1
@@ -262,9 +261,9 @@ async def compute_nonce_artifacts(
             _inflight.discard(request_id)
         return None
 
-    # Скользящая подача волнами: окно ограничивает одновременность, волна —
-    # сколько нонсов сажаем разом (посадка по одному голодает декод при
-    # uniform-step). POC_ROLLING_WINDOW=0 (умолчание) — банкетная подача.
+    # Rolling admission in waves: the window caps concurrency, the wave is how
+    # many nonces are admitted at once (one at a time starves decode under
+    # uniform-step). POC_ROLLING_WINDOW=0 (default) = all-at-once admission.
     window = _rolling_window(len(nonces))
     if window and len(nonces) > window:
         wave = _rolling_wave(window)

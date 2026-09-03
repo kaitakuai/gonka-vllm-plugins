@@ -47,7 +47,7 @@ _VEC_STAT = {"n": 0, "mt": None, "len": None, "has_mgr": None}
 
 
 def _diag_now():
-    """POC_DIAG=1: монотонное время (сек) для таймеров эмиссии; иначе None."""
+    """POC_DIAG=1: monotonic time (sec) for emission timers; else None."""
     import os, time
     if os.environ.get("POC_DIAG", "") != "1":
         return None
@@ -77,8 +77,8 @@ def encode_sph_slices(q_host, block_hash, public_key, nonce, k_dim, debug):
     if debug:
         return [encode_vector(row) for row in q_host]
     cpu = torch.device("cpu")
-    # Индексы всех шагов одной пачкой; побитово равны пошаговым random_pick_indices_decode
-    # (tests/unit/test_pick_indices_steps.py).
+    # All steps' indices in one batch; bitwise equal to per-step
+    # random_pick_indices_decode (tests/unit/test_pick_indices_steps.py).
     idx_all = random_pick_indices_decode_steps(
         block_hash, public_key, nonce, SPHERE_DIM, k_dim, cpu,
         list(range(len(q_host)))).numpy()
@@ -255,12 +255,12 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     if mgr is None:
         cc = runner.cache_config
         sc = runner.vllm_config.scheduler_config
-        # Слоты состояния KV не держат: пул — по max_num_seqs (или явному
-        # poc_max_batch_size), без клампа poc_kv_capacity: под гибридным KV
-        # block_size — от самой мелкой группы, и формула занижает пул; строка без
-        # слота молча теряет нонс. KV-кламп остаётся у планировщика (admission.py).
+        # State slots hold no KV: size the pool by max_num_seqs (or an explicit
+        # poc_max_batch_size) without the poc_kv_capacity clamp: under hybrid KV
+        # block_size comes from the smallest group and the formula undersizes the
+        # pool; a row without a slot silently drops its nonce. KV clamp: admission.py.
         cap = resolve_poc_max_batch_size(cc.poc_max_batch_size, sc.max_num_seqs, 0)
-        logger.info("poc: пул состояний decode-PoC: %d слотов (configured=%d, "
+        logger.info("poc: decode-PoC state pool: %d slots (configured=%d, "
                     "max_num_seqs=%d, num_gpu_blocks=%s, block_size=%s)",
                     cap, cc.poc_max_batch_size, sc.max_num_seqs,
                     getattr(cc, "num_gpu_blocks", None), getattr(cc, "block_size", None))
@@ -456,10 +456,10 @@ def build_unified_mixed_batch_inputs(
                 offset += 1
             elif (poc_params.max_tokens > 0
                   and req_state.num_computed_tokens >= seq_len):
-                # Призрак: decode-строка уже эмитирована и освобождена (st is None),
-                # но асинхронный планировщик успел дать ей ещё шаг. Иначе она уходит
-                # в префилловый путь (generate_inputs + host-sync на каждую строку).
-                # Выход не нужен: нули, маска False, без метаданных.
+                # Ghost: the decode row was already emitted and freed (st is None),
+                # but the async scheduler gave it one more step. Otherwise it would
+                # take the prefill path (generate_inputs + host-sync per row).
+                # No output needed: zeros, mask False, no metadata.
                 unified_embeds[offset:offset + num_tokens].zero_()
                 unified_positions[offset:offset + num_tokens] = (
                     chat_positions[offset:offset + num_tokens])
@@ -829,13 +829,13 @@ def process_poc_outputs_from_hidden(
                 _chain_prev_candidate)
 
     if _VEC_STAT["n"]:
-        logger.info("poc: vector_b64 (ветка st is None) для %d строк в шаге: "
-                    "max_tokens=%s length=%s слот в менеджере есть=%s",
+        logger.info("poc: vector_b64 (st is None branch) for %d rows in step: "
+                    "max_tokens=%s length=%s slot in manager=%s",
                     _VEC_STAT["n"], _VEC_STAT["mt"], _VEC_STAT["len"], _VEC_STAT["has_mgr"])
         _VEC_STAT.update(n=0)
     if _EMIT_STAT["n"]:
-        logger.info("poc: эмиссия %d строк: k/margin (cat+tolist+item) %.0f мс, "
-                    "q (cat+cpu+encode) %.0f мс, q_steps на строку %.0f",
+        logger.info("poc: emitted %d rows: k/margin (cat+tolist+item) %.0f ms, "
+                    "q (cat+cpu+encode) %.0f ms, q_steps per row %.0f",
                     _EMIT_STAT["n"], _EMIT_STAT["k"] * 1000, _EMIT_STAT["q"] * 1000,
                     _EMIT_STAT["q_steps"] / _EMIT_STAT["n"])
         _EMIT_STAT.update(n=0, k=0.0, q=0.0, q_steps=0)

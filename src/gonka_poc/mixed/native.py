@@ -73,7 +73,7 @@ def _assert_replicated_across_tp(t: torch.Tensor, name: str) -> None:
 
 
 def _reflect_torch(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Masked Householder (эталон): rows where mask is True -> x - 2*(x·v)*v; else x.
+    """Masked Householder (reference): rows where mask is True -> x - 2*(x·v)*v; else x.
     Per-row independent, static-shape (no data-dependent control flow) -> the
     compiled graph captures it; cudagraph replays it reading live v/mask."""
     dot = (x * v).sum(-1, keepdim=True)
@@ -82,9 +82,9 @@ def _reflect_torch(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torc
 
 
 def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Отражение на PoC-строках: слитое Triton-ядро (один проход по строке)
-    там, где оно доступно, иначе эталон из четырёх ядер. v: [n, *pad, hidden],
-    mask: [n, *pad, 1] — как подаёт PoCLayerWrapper._apply."""
+    """Reflection on PoC rows: fused Triton kernel (one pass per row) where
+    available, else the four-kernel reference. v: [n, *pad, hidden],
+    mask: [n, *pad, 1] — as fed by PoCLayerWrapper._apply."""
     if x.is_cuda and _reflect_kernel.fused_enabled():
         n = x.shape[0]
         return _reflect_kernel.reflect_fused(
@@ -183,8 +183,8 @@ class PoCEmbeddingWrapper(nn.Module):
         # Force masked (PoC) rows to a valid in-vocab id (0); their value is unused.
         n = input_ids.shape[0]
         m_rows = self.poc_mask[:n]
-        # PoC-строки: poc_token_ids (сидированный id на hash-MoE, иначе нули —
-        # id доходит до MoE-роутера по tid2eid, см. _TOKEN_ID_ROUTED_MODELS).
+        # PoC rows: poc_token_ids (seeded id on hash-MoE, else zeros — the id
+        # reaches the MoE router via tid2eid, see _TOKEN_ID_ROUTED_MODELS).
         input_ids = torch.where(m_rows, self.poc_token_ids[:n].to(input_ids.dtype),
                                 input_ids)
         out = self._inner_call(input_ids)
@@ -249,7 +249,7 @@ def _experts_meta(experts) -> tuple:
     gate+experts module we cannot read is a HARD error — a silently unseeded
     router re-opens the MoE honest-floor hole."""
     # FusedMoE: global_num_experts; DeepSeek-V4 MegaMoE: num_experts
-    # (num_local_experts — EP-шард, роутер по нему не считает).
+    # (num_local_experts is the EP shard; the router does not count by it).
     n_global = getattr(experts, "global_num_experts",
                        getattr(experts, "num_experts", None))
     if hasattr(experts, "top_k") and n_global is not None:
@@ -418,8 +418,8 @@ class PoCNativeState:
         self.embed_base = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.embed_prev_k = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self.embed_step = torch.zeros(max_tokens, dtype=torch.int64, device=device)
-        # Псевдо-номера токенов для hash-MoE; token_id_vocab==0 — модель не
-        # роутит по id, буфер остаётся нулевым (attach_native_poc включает).
+        # Pseudo token ids for hash-MoE; token_id_vocab==0 — the model does not
+        # route by id, buffer stays zero (attach_native_poc enables it).
         self.token_id_vocab = 0
         self.poc_token_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         # PoC-as-a-sampler, part 2: SNAP = SAMPLING. A wrapper on the final norm snaps
@@ -463,8 +463,8 @@ class PoCNativeState:
                     base, step, prev_k, self.token_id_vocab))
 
     def set_prefill_token_ids(self, offs: torch.Tensor, ids: torch.Tensor) -> None:
-        """Псевдо-номера токенов для префилл-строк нонса (только hash-MoE;
-        вызывающий гейтится по token_id_vocab)."""
+        """Pseudo token ids for nonce prefill rows (hash-MoE only; the caller
+        gates on token_id_vocab)."""
         self.poc_token_ids.index_copy_(0, offs, ids.to(torch.int32))
 
     # Device-side cache bound: per-nonce seeding adds one entry per (block_hash,
@@ -638,17 +638,17 @@ class PoCNativeState:
             self.mask[:n].copy_(row_mask)
 
 
-# Архитектуры, у которых MoE-гейт выбирает экспертов по номеру токена (таблица
-# на гейте, у DeepSeek-V4 — tid2eid). Их гейты остаются с натуральными весами;
-# псевдо-номера токенов включены для всех моделей. Модель вне списка с такой
-# таблицей отвергается при attach — список расширяется только после проверки.
+# Architectures whose MoE gate picks experts by token id (integer table on the
+# gate; tid2eid on DeepSeek-V4). Their gates keep natural weights; pseudo token
+# ids are enabled for all models. A model outside this list with such a table
+# is rejected at attach — extend the list only after verification.
 _TOKEN_ID_ROUTED_MODELS = ("deepseek_v4",)
 
 
 def _token_id_table(gate) -> torch.Tensor | None:
-    """Целочисленная 2-D таблица на гейте (у DeepSeek-V4 — tid2eid[vocab, k]):
-    признак маршрутизации по номеру токена. Float-параметры гейта (веса,
-    e_score_correction_bias) под признак не попадают."""
+    """Integer 2-D table on the gate (DeepSeek-V4: tid2eid[vocab, k]) marks
+    token-id routing. Float gate parameters (weights, e_score_correction_bias)
+    do not qualify."""
     for _, t in list(gate.named_parameters(recurse=False)) + list(gate.named_buffers(recurse=False)):
         if t is not None and t.dim() == 2 and t.dtype in (torch.int32, torch.int64):
             return t
@@ -659,12 +659,12 @@ _ABLATE = frozenset(x.strip() for x in os.environ.get("POC_ABLATE", "").lower().
 
 
 def _ablated(part: str) -> bool:
-    """POC_ABLATE=reflect,router,pseudo — ДИАГНОСТИКА: отключить вмешательство
-    PoC, чтобы найти дефект (зависание >~200 PoC-строк на Hopper). Ломает
-    консенсус — корпуса в этом режиме для вердиктов НЕПРИГОДНЫ.
-      reflect — отражения Хаусхолдера на слоях (PoCLayerWrapper не ставится);
-      router  — сидирование экспертов (PoCRouterWrapper не ставится);
-      pseudo  — псевдо-номера токенов на hash-MoE (dummy ids как раньше)."""
+    """POC_ABLATE=reflect,router,pseudo — DIAGNOSTIC: disable PoC intervention
+    to isolate a defect (e.g. hang above ~200 PoC rows on Hopper). Breaks
+    consensus — corpora produced in this mode are UNFIT for verdicts.
+      reflect — Householder reflections on layers (no PoCLayerWrapper);
+      router  — expert seeding (no PoCRouterWrapper);
+      pseudo  — pseudo token ids on hash-MoE (dummy ids as before)."""
     return part in _ABLATE
 
 
@@ -677,15 +677,15 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
     state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
-    # Слитое отражение компилируется при первом вызове; сделать это здесь, до
-    # захвата CUDA-графов, чтобы JIT не попал внутрь захвата.
+    # The fused reflect JIT-compiles on first call; do it here, before CUDA-graph
+    # capture, so the JIT does not land inside the capture.
     try:
         _fused = _reflect_kernel.warmup(hidden_size, device, dtype)
-    except Exception as e:  # noqa: BLE001 — откат на эталон, не падение
-        logger.warning("PoC fused reflect: прогрев не удался (%r), эталонный путь", e)
+    except Exception as e:  # noqa: BLE001 — fall back to reference, not a crash
+        logger.warning("PoC fused reflect: warmup failed (%r), reference path", e)
         os.environ["POC_FUSED_REFLECT"] = "0"
         _fused = False
-    logger.info("PoC reflect: %s", "слитое Triton-ядро" if _fused else "эталон (4 ядра)")
+    logger.info("PoC reflect: %s", "fused Triton" if _fused else "4-kernel reference")
     vocab = int(getattr(hf_config, "vocab_size", 0) or 0)
     if vocab and not _ablated("pseudo"):
         state.token_id_vocab = vocab
@@ -694,7 +694,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # ahead of time and resolves parameters by qualified name, so re-parenting a
     # layer under a wrapper breaks the compiled graph's parameter map.
     if _ABLATE:
-        logger.warning("POC_ABLATE=%s: диагностический режим, артефакты НЕ консенсусные",
+        logger.warning("POC_ABLATE=%s: diagnostic mode, artifacts NOT consensus-safe",
                        ",".join(sorted(_ABLATE)))
     if not _ablated("reflect"):
         for i, layer in enumerate(layers):
@@ -737,9 +737,9 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
                     f"(integer table on the gate), but model_type "
                     f"{getattr(hf_config, 'model_type', None)!r} is not in "
                     "_TOKEN_ID_ROUTED_MODELS — verify the model, then add it")
-            # Hash-MoE (DeepSeek-V4): выбор экспертов — tid2eid[input_ids], уже
-            # детерминирован псевдо-номерами; логиты дают только веса. Форсинг
-            # лестницы обнулил бы веса табличных экспертов — оставляем натуральные.
+            # Hash-MoE (DeepSeek-V4): expert choice is tid2eid[input_ids], already
+            # determined by pseudo token ids; logits only give weights. Forcing the
+            # ladder would zero the table experts' weights — keep natural.
             skipped_hash += 1
             continue
         n_exp, top_k = _experts_meta(moe.experts)

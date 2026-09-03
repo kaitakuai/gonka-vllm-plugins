@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Слитое отражение Хаусхолдера (Triton): y = x - 2*(x·v)*v на строках под
-маской, иначе y = x. Эквивалент `_reflect_torch` из native.py.
+"""Fused Householder reflection (Triton): y = x - 2*(x·v)*v on masked rows,
+y = x otherwise. Equivalent to `_reflect_torch` in native.py.
 
-Математика консенсуса: точки округления bf16 повторяют эталон; отличается
-только порядок суммирования dot внутри блока (последние биты). Ядро статично
-по форме и захватывается в CUDA-граф, поэтому компилируется в `warmup()` до
-захвата.
+Consensus math: the bf16 rounding points match the torch reference; only the
+summation order of the in-block dot differs (last bits). The kernel is static
+in shape and captured into the CUDA graph, so it is compiled in `warmup()`
+before capture.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import os
 
 import torch
 
-try:  # Triton ставится вместе с vLLM; без него — эталонный путь
+try:  # Triton ships with vLLM; without it, fall back to the torch reference
     import triton
     import triton.language as tl
     _HAVE_TRITON = True
@@ -35,7 +35,7 @@ if _HAVE_TRITON:
         r = tl.program_id(0)
         if r >= n_rows:
             return
-        row = r // copies                  # исходная строка: у неё вектор и маска
+        row = r // copies                  # source row: owns the vector and mask
         cols = tl.arange(0, BLOCK)
         cmask = cols < hidden
         x = tl.load(x_ptr + r * x_row_stride + cols, mask=cmask, other=0.0)
@@ -62,7 +62,7 @@ if _HAVE_TRITON:
 
 def reflect_fused(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """x: [n, *copies, hidden]; v: [n, hidden] (dtype x); mask: [n] bool.
-    Возвращает новый тензор формы x (как torch.where в эталоне)."""
+    Returns a new tensor shaped like x (as torch.where in the reference)."""
     n = x.shape[0]
     hidden = x.shape[-1]
     x2 = x.contiguous().view(-1, hidden)
@@ -80,7 +80,7 @@ def reflect_fused(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch
 
 
 def warmup(hidden: int, device, dtype=torch.bfloat16) -> bool:
-    """Скомпилировать ядро до захвата CUDA-графов. True, если слитый путь активен."""
+    """Compile the kernel before CUDA-graph capture. True if the fused path is on."""
     if not fused_enabled() or not torch.cuda.is_available():
         return False
     x = torch.zeros(2, hidden, device=device, dtype=dtype)

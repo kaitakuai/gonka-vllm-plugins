@@ -279,9 +279,9 @@ def random_pick_indices_decode_steps(
     device: torch.device,
     steps: List[int],
 ) -> torch.Tensor:
-    """Те же индексы, что random_pick_indices_decode(..., [nonce], step=s) для
-    каждого s из steps, одной пачкой [len(steps), k] (один murmur, один topk —
-    для эмиссии траектории). Вариант с prev_point_ids не поддерживается."""
+    """Same indices as random_pick_indices_decode(..., [nonce], step=s) for each
+    s in steps, as one batch [len(steps), k] (one murmur, one topk; used for
+    trajectory emission). prev_point_ids is not supported."""
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
     seeds = [_seed_from_string(
