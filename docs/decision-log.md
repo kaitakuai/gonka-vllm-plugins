@@ -3,6 +3,21 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-03 — Seeded-routing ladder base is per model
+
+Validating the frozen MiniMax-M2.7 reference corpora (48 corpora, 10 block hashes,
+B300 and 4×H100 validators) on this branch doubled every τ=0 cell (honest 7 → 15%,
+fraud 12 → 18%). Bisection over the plugin knobs, the batched-token budget, the
+checkpoint revision and the old stack rebuilt side by side pointed at one line:
+`LADDER_BASE = 100` in the forced router logits, added for DeepSeek-V4
+(sqrtsoftplus scoring with router bias) but applied to every model. On MiniMax it
+changes which experts win under bias, i.e. it is a consensus parameter. The base
+is now chosen at attach by `model_type`: 100 for `deepseek_v4`, 0 otherwise; with
+base 0 the MiniMax cells return to the frozen values (7.1 / 11.9 / 7.8 / 11.8 vs
+7.0 / 11.7 / 7.9 / 11.7 at τ=0). DeepSeek-V4 goldens captured on 03.09 used base
+100 and are unaffected. Rule: any change to seeding, ladder or PoC math is gated
+by the MiniMax golden regression before release.
+
 ## 2026-09-03 — vLLM 0.25.1 is the release line; Hopper TP>1 needs `--no-async-scheduling`
 
 The release targets vLLM 0.25.1 only (Vlad's request), so the branch pair
