@@ -701,6 +701,10 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     # Patch forward IN PLACE (never replace the module): 0.25 compiles the model
     # ahead of time and resolves parameters by qualified name, so re-parenting a
     # layer under a wrapper breaks the compiled graph's parameter map.
+    if _ABLATE:
+        logger.warning("POC_ABLATE=%s: диагностический режим, артефакты НЕ консенсусные; "
+                       "выключено: %s", ",".join(sorted(_ABLATE)),
+                       ", ".join(p for p in ("reflect", "router", "pseudo") if _ablated(p)))
     if _ablated("reflect"):
         logger.warning("POC_ABLATE=reflect: отражения Хаусхолдера ОТКЛЮЧЕНЫ — диагностика, не консенсус")
     for i, layer in enumerate(layers if not _ablated("reflect") else []):

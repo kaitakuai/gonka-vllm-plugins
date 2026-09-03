@@ -188,14 +188,18 @@ class PoCAdmission:
     __slots__ = ("active", "_defer_chat", "_defer_poc", "_max_batch",
                  "_token_budget", "_scheduled", "_tokens", "_poc_prefill",
                  "_scheduler", "_prefill_landing", "_any_scheduled", "_stalled",
-                 "_new_prefills", "_prefill_allow")
+                 "_new_prefills", "_prefill_allow", "_step_budget", "_all_tokens")
 
     # Сколько шагов держать шаг за декодом после застрявшего префилла, прежде
     # чем снова попробовать префилл (если ни одна строка не завершилась раньше).
     STALL_RETRY_STEPS = 16
 
     def __init__(self, scheduler, token_budget: int) -> None:
-        queues = (scheduler.running, scheduler.waiting)
+        # skipped_waiting: строки, отложенные skip() в прошлом шаге, в 0.28 лежат
+        # в отдельной очереди и планируются первыми (FCFS). Без них скан не видит
+        # ожидающий PoC-префилл или чат-префилл и снимает все гейты (ревью 03.09).
+        queues = (scheduler.running, scheduler.waiting,
+                  getattr(scheduler, "skipped_waiting", None) or ())
         # ONE pass for all four flags. As four separate any() calls, the ones whose
         # answer is "no" walk the whole of running+waiting every step — and on a
         # PoC-only node both chat questions are exactly that, so the queues were
@@ -301,6 +305,13 @@ class PoCAdmission:
         self._tokens = 0
         self._any_scheduled = 0
         self._new_prefills = 0
+        # Полный бюджет шага и всё, что в нём уже занято (чат и PoC): PoC-префилл
+        # садится только целиком (seq_len), а планировщик к этому моменту уже
+        # сжал num_new_tokens до остатка бюджета — num_tokens() возвращает
+        # seq_len поверх клэмпа, и без этой проверки шаг переполнялся
+        # (assert token_budget >= 0 в schedule(), гибель EngineCore; ревью 03.09).
+        self._step_budget = int(token_budget)
+        self._all_tokens = 0
 
         # Живость (лайвлок на Hopper, 01.09.2026). Если прошлый шаг объявил
         # префилл PoC, но не запланировал НИ ОДНОЙ строки — ожидающим не хватило
@@ -410,10 +421,14 @@ class PoCAdmission:
         return poc_step_num_tokens(request.poc_params, request.num_computed_tokens)
 
     def over_budget(self, request: "Request", num_new_tokens: int) -> bool:
-        """True once PoC has consumed its slice of this step's token budget."""
+        """True once PoC has consumed its slice of this step's token budget, or
+        when the whole step cannot take these tokens on top of what chat and
+        PoC already scheduled (a PoC prefill is all-or-nothing)."""
         if not self.active or request.poc_params is None:
             return False
-        return self._tokens + num_new_tokens > self._token_budget
+        if self._tokens + num_new_tokens > self._token_budget:
+            return True
+        return self._all_tokens + num_new_tokens > self._step_budget
 
     def alloc_tokens(self, request: "Request", num_new_tokens: int) -> int:
         """KV footprint to reserve via the shared KVCacheManager."""
@@ -425,6 +440,7 @@ class PoCAdmission:
         if not self.active:
             return
         self._any_scheduled += 1
+        self._all_tokens += int(num_new_tokens)
         if request.poc_params is None:
             return
         self._scheduled += 1
