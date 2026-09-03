@@ -6,6 +6,7 @@ v0.1.x -- so the decode scheme may not add a parameter, a branch or an
 allocation to it. Shared primitives are imported, never copied: both schemes
 must hash and draw through the exact same code.
 """
+import os
 import logging
 import math
 from typing import List, Optional
@@ -165,9 +166,12 @@ _ladder_base = 0
 
 
 def set_ladder_base_for_model(model_type) -> int:
-    """Select the ladder base for ``model_type`` (called once at attach)."""
+    """Select the ladder base for ``model_type`` (called once at attach).
+    POC_LADDER_BASE=<int> overrides it — experiments only, corpora produced
+    under an override are not consensus-safe."""
     global _ladder_base
-    _ladder_base = _LADDER_BASE_BY_MODEL.get(model_type, 0)
+    override = os.environ.get("POC_LADDER_BASE", "").strip()
+    _ladder_base = int(override) if override else _LADDER_BASE_BY_MODEL.get(model_type, 0)
     return _ladder_base
 
 
