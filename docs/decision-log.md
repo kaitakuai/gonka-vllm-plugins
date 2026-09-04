@@ -29,6 +29,13 @@ value the traced forward reads must be a source constant or a tensor buffer, nev
 environment or config value; boot provenance records the compile-cache key and whether
 the graph was loaded or compiled.
 
+The same trap applies to the diagnostic knobs that change the traced forward
+(`POC_FUSED_REFLECT`, `POC_ABLATE`, `VLLM_POC_DEBUG_TP`): a fused-off boot on a host
+with a compiled graph loaded the fused graph. The plugin now scopes `VLLM_CACHE_ROOT`
+to a sub-directory named by a hash of the non-default knob values, in every process at
+plugin load (`compile_cache.py`); defaults keep the unscoped root, so production caches
+are untouched. Knobs that change the traced forward are listed in one place there.
+
 ## 2026-09-03 — Seeded-routing ladder base is per model
 
 Validating the frozen MiniMax-M2.7 reference corpora (48 corpora, 10 block hashes,

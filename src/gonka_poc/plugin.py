@@ -59,6 +59,15 @@ def register() -> None:
     _adopt_vllm_logging()
 
     try:
+        # Before anything compiles: knobs that change the traced forward get
+        # their own compile cache (see compile_cache.py). No-op at defaults.
+        from gonka_poc.compile_cache import scope_compile_cache
+
+        scope_compile_cache()
+    except Exception as exc:
+        logger.warning("gonka_poc.plugin.register: compile cache scoping skipped: %s", exc)
+
+    try:
         from gonka_poc._compat import current as _compat_current
 
         _compat_current().install_engine_core_poc_methods()

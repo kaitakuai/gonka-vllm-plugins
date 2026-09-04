@@ -54,10 +54,13 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 | `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
 
-`POC_FUSED_REFLECT` and `POC_ABLATE` change the traced forward, but the compile-cache
-key hashes the traced source and the config, not the environment: toggling either on a
-host that already holds a compiled graph loads the old graph. Use a fresh
-`VLLM_CACHE_ROOT` when you flip them (see the decision log, 2026-09-04).
+`POC_FUSED_REFLECT`, `POC_ABLATE` and `VLLM_POC_DEBUG_TP` change the traced forward,
+and vLLM's compile-cache key hashes the traced source and the config, not the
+environment. The plugin therefore scopes `VLLM_CACHE_ROOT` to a knob-specific
+sub-directory (`gonka-poc-knobs-<hash>`) whenever one of them is set away from its
+default, in every process, before anything compiles (`compile_cache.py`). Defaults keep
+the unscoped root. A new knob that changes the traced forward must be added to
+`_TRACED_KNOBS` there.
 
 `poc_max_batch_size`, `poc_share`, `poc_seq_len`, `poc_max_tokens` are read
 through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI
