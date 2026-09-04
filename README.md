@@ -54,6 +54,11 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 | `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
 
+`POC_FUSED_REFLECT` and `POC_ABLATE` change the traced forward, but the compile-cache
+key hashes the traced source and the config, not the environment: toggling either on a
+host that already holds a compiled graph loads the old graph. Use a fresh
+`VLLM_CACHE_ROOT` when you flip them (see the decision log, 2026-09-04).
+
 `poc_max_batch_size`, `poc_share`, `poc_seq_len`, `poc_max_tokens` are read
 through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI
 arguments for PoC. See [ADR-0016](docs/adr/ADR-0016-hopper-admission-and-fused-reflection.md).
