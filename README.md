@@ -53,7 +53,6 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 | `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_MIXED_BATCH`). |
 | `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
-| `POC_LADDER_BASE` | per model | override of the seeded-routing ladder base (consensus parameter; 100 for `deepseek_v4`, 0 otherwise). Experiments only. The base reaches the compiled forward through a buffer, so changing it between boots is safe with the compile cache; before 4a6a230 it was baked into the cached graph. |
 
 `poc_max_batch_size`, `poc_share`, `poc_seq_len`, `poc_max_tokens` are read
 through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI

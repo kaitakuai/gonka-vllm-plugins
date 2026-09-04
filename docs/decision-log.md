@@ -3,30 +3,31 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
-## 2026-09-03 — Values read in traced code go through buffers, never Python constants
+## 2026-09-04 — Consensus constants in traced code change only through source
 
-A ladder-base experiment on 1×B300 (MiniMax-M2.7, base 100 then base 0 on the same
-host) produced honest cross-hardware cells of 15–17% at τ=0 instead of 8%, in both
-directions and across boots, with expert-level flips (τ=0.05 no longer zero). Attribution
-and a git bisect of the plugin on B300 (probe: validate a corpus made by the old stack on
-the same card, plus H100 corpora) showed every "bad" boot loading the compiled graph from
-vLLM's cache and every "good" one compiling fresh. Cause: the ladder base was a module
-global read inside the router wrapper's forward, which is traced and captured; Dynamo
-baked the value into the graph, and the compile-cache key hashes the traced source and
-the config, not that value. The first boot on the code compiled with base 100 and every
-later base-0 boot with the same code and batch config ran base 100 while logging base 0.
-The 16% cells were base mismatch (the same doubling as the golden regression), not
-hardware noise; honest MiniMax noise does not depend on the base.
+A ladder-base experiment on 1×B300 (MiniMax-M2.7: boot with `POC_LADDER_BASE=100`, then
+boots with base 0 on the same host) produced honest cross-hardware cells of 15–17% at τ=0
+instead of 8%, in both directions and across boots. Attribution and a git bisect on B300
+(probe: validate a corpus made by the old stack on the same card, plus H100 corpora)
+showed every "bad" boot loading the compiled graph and the AOT artifact from vLLM's
+cache and every "good" one compiling fresh. The forced-logits path runs inside the
+traced and captured router forward, so Dynamo bakes the ladder base into the graph; the
+compile-cache key hashes the traced source files and the config, not runtime values. A
+boot that overrides the base through the environment therefore poisons the cache for
+every later boot with the same code and batch config, which then runs the foreign base
+while logging its own. Verified with a controlled triple on a fresh cache root: the third
+boot (base 100 in the environment) loaded the base-0 graph and validated base-0 corpora at
+8%. The 16% cells were base mismatch, not hardware noise; honest MiniMax noise does not
+depend on the base.
 
-Fix 4a6a230: the base lives in a 0-dim buffer on the wrapper and is read by the graph
-like the seed, step and mask buffers. Verified on 1×B300 with a controlled triple on a
-fresh cache root (boot base 100, boot base 0, boot base 100 that loads the base-0 graph
-and AOT artifact): without the fix the third boot validates base-0 corpora at 8% while
-logging base 100 (it runs base 0); with the fix it gives 16% (true base 100), and a
-base-0 boot on the same cache stays at 8%. Rule: anything the forward reads that can differ
-between boots (env, config, per-model tables) must be a buffer or part of the cache key;
-boot provenance now records the compile-cache key and whether the graph was loaded or
-compiled.
+Decision: the base stays a per-model source constant (`_LADDER_BASE_BY_MODEL`) and the
+`POC_LADDER_BASE` environment override is removed (cc4507e reverted). Changing the base
+means changing the source, and the source is part of the cache key, so the graph is
+recompiled. A buffer-based variant (4a6a230, verified on B300) was reverted as
+unnecessary logic for production, where the base never changes at run time. Rule: any
+value the traced forward reads must be a source constant or a tensor buffer, never an
+environment or config value; boot provenance records the compile-cache key and whether
+the graph was loaded or compiled.
 
 ## 2026-09-03 — Seeded-routing ladder base is per model
 
