@@ -26,8 +26,7 @@ logger = logging.getLogger(__name__)
 from gonka_poc.poc.gpu_random import (generate_householder_vector,
                                       _seed_from_string)
 from gonka_poc.poc.decode_random import (decode_pseudo_token_ids,
-                                         expert_logits_from_base, ladder_base_tensor,
-                                         route_base_seed,
+                                         expert_logits_from_base, route_base_seed,
                                          pinned_to_device)
 
 # Debug-only TP guard (VLLM_POC_DEBUG_TP=1): PoC reflection vectors / embeds are
@@ -289,13 +288,6 @@ class PoCRouterWrapper(nn.Module):
         self.register_buffer("poc_route_base", route_base, persistent=False)  # [max_tokens] int64
         self.register_buffer("poc_route_step", route_step, persistent=False)  # [max_tokens] int64 (shared)
         self.register_buffer("poc_mask", mask, persistent=False)
-        # Ladder base as a buffer, NOT a Python int: the forward below is traced and
-        # captured, and a Python int would be baked into the graph; vLLM's compile
-        # cache key hashes the traced source, not the value, so a cached graph would
-        # silently carry the base of the boot that compiled it (03.09: every B300
-        # boot after a base-100 boot ran base 100 while logging base 0).
-        self.register_buffer("poc_ladder_base", ladder_base_tensor(route_base.device),
-                             persistent=False)
 
     def __getattr__(self, name: str):
         # Delegate unknown attributes (e.g. `.weight`, quant scales) to the wrapped
@@ -313,8 +305,7 @@ class PoCRouterWrapper(nn.Module):
         m = self.poc_mask[:n].unsqueeze(-1)
         forced = expert_logits_from_base(                   # in-graph seeded selection
             self.poc_route_base[:n], self.poc_route_step[:n],
-            self.n_experts, self.top_k, logits.device,
-            self.poc_ladder_base).to(logits.dtype)
+            self.n_experts, self.top_k, logits.device).to(logits.dtype)
         logits = torch.where(m, forced, logits)
         return (logits, *out[1:]) if isinstance(out, tuple) else logits
 

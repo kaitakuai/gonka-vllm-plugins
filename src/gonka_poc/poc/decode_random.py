@@ -180,8 +180,7 @@ def ladder_base() -> int:
 
 
 def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
-                   device: torch.device,
-                   ladder_base: "torch.Tensor | None" = None) -> torch.Tensor:
+                   device: torch.device) -> torch.Tensor:
     """THE seeded expert selection — single source of truth for seeded routing.
 
     Contiguous seeded run: ``start = seed % n_experts``, experts
@@ -193,30 +192,18 @@ def _forced_logits(seed: torch.Tensor, n_experts: int, top_k: int,
     per-layer reflections and the chained snap. Returns [B, n_experts]
     forced logits: the chosen run holds descending ladder values
     ``base+top_k .. base+1`` (``base`` from ``set_ladder_base_for_model``),
-    the rest a low floor.
-
-    ``ladder_base``: optional 0-dim float32 tensor holding the base. Traced code
-    (the gate wrapper inside the compiled/captured forward) MUST pass it: a Python
-    int read here would be baked into the graph as a constant, and vLLM's compile
-    cache key covers the traced source, not the value — a cached graph would then
-    carry the base of whichever boot compiled it first. A tensor is a graph input,
-    read live on every call. Eager callers may leave it None and use the global."""
+    the rest a low floor."""
     b = seed.shape[0]
     start = torch.remainder(seed.view(-1, 1), n_experts)             # [B,1]
     offs = torch.arange(top_k, device=device, dtype=torch.int64)     # [k]
     chosen = torch.remainder(start + offs.unsqueeze(0), n_experts)   # [B,k]
     logits = torch.full((b, n_experts), -1.0e4, device=device,
                         dtype=torch.float32)
-    ladder = torch.arange(top_k, 0, -1, device=device, dtype=torch.float32)
-    ladder = ladder + (ladder_base if ladder_base is not None else _ladder_base)
-    logits.scatter_(1, chosen, ladder.unsqueeze(0).expand(b, -1))
+    logits.scatter_(1, chosen,
+                    (torch.arange(top_k, 0, -1, device=device,
+                                  dtype=torch.float32)
+                     + _ladder_base).unsqueeze(0).expand(b, -1))
     return logits
-
-
-def ladder_base_tensor(device: torch.device) -> torch.Tensor:
-    """The current ladder base as a 0-dim float32 device tensor, for traced code
-    (see ``_forced_logits``). Call after ``set_ladder_base_for_model``."""
-    return torch.tensor(float(_ladder_base), dtype=torch.float32, device=device)
 
 
 def decode_pseudo_token_ids(base_seeds: torch.Tensor, step: int | torch.Tensor,
@@ -244,15 +231,14 @@ def route_base_seed(block_hash: str, nonce: int, layer: int) -> str:
 
 def expert_logits_from_base(base_ints: torch.Tensor, steps: torch.Tensor,
                             n_experts: int, top_k: int,
-                            device: torch.device,
-                            ladder_base: "torch.Tensor | None" = None) -> torch.Tensor:
+                            device: torch.device) -> torch.Tensor:
     """Per-row forced router logits: fold the decode ``step`` into the cached base seed
     ON GPU, then the shared _forced_logits pick. ``base_ints``/``steps`` are [B]
     int64; returns [B, n_experts]. All integer (bit-exact cross-HW), no host loop, no
     device->host sync. Equivalent per (row, layer) to seeded_experts()."""
     seed = _batched_murmur3_32(steps.view(-1, 1).to(torch.int32),
                                base_ints.view(-1, 1))               # [B,1] = fold step into base
-    return _forced_logits(seed, n_experts, top_k, device, ladder_base)
+    return _forced_logits(seed, n_experts, top_k, device)
 
 
 def seeded_experts(block_hash: str, nonce: int, step: int, layer: int,
