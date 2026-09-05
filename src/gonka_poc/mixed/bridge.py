@@ -70,7 +70,6 @@ class PoCRunnerBridge:
         from gonka_poc.mixed.native import attach_native_poc
 
         runner = self.runner
-        cfg = runner.vllm_config.cache_config
         inner = getattr(model, "model", model)
         layers = getattr(inner, "layers", None)
         if layers is None:

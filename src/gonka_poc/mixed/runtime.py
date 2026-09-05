@@ -15,14 +15,17 @@ model-runner helpers at the bottom (moved out of gpu_model_runner.py to keep the
 core vLLM footprint minimal) take the GPUModelRunner as ``runner``. Validation
 runs pure.
 """
-import os
-import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
 
 from gonka_poc.mixed.policy import poc_cfg
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import PoCOutput
 
 logger = init_logger(__name__)
 
