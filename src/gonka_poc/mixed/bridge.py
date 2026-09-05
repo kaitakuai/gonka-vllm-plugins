@@ -86,28 +86,34 @@ class PoCRunnerBridge:
 
     # --------------------------------------------------------- per-step hooks
     def pre_step(self, scheduler_output: "SchedulerOutput") -> None:
-        # Register before the early return: poc_req_ids is None whenever the
-        # scheduler saw no PoC request in its queues at the top of schedule(),
-        # yet the same step still hands newly admitted PoC rows here. Skipping
-        # registration left them unknown, and the next step — which does list
-        # them — died on KeyError inside execute_model, killing the engine.
-        # scheduled_cached_reqs cannot repair it: it carries no poc_params.
+        # The bridge keeps its own registry of PoC rows: a row is registered
+        # the step it first appears (NewRequestData.poc_params) and forgotten
+        # when the scheduler reports it finished. The rows of THIS step are
+        # the registered ones among what the scheduler scheduled (new or
+        # cached) — no PoC-specific field on SchedulerOutput is needed.
         for r in scheduler_output.scheduled_new_reqs:
             if r.poc_params is not None:
                 self._reqs[r.req_id] = _PoCRequestView(
                     r.req_id, r.poc_params, r.num_computed_tokens)
         for rid in scheduler_output.finished_req_ids:
             self._reqs.pop(rid, None)
-
-        poc_req_ids = getattr(scheduler_output, "poc_req_ids", None)
-        if not poc_req_ids:
+        if not self._reqs:
             self._step = None
             return
+
+        poc_req_ids: set[str] = set()
         cached = scheduler_output.scheduled_cached_reqs
         for i, rid in enumerate(cached.req_ids):
             view = self._reqs.get(rid)
             if view is not None:
                 view.num_computed_tokens = cached.num_computed_tokens[i]
+                poc_req_ids.add(rid)
+        for r in scheduler_output.scheduled_new_reqs:
+            if r.req_id in self._reqs:
+                poc_req_ids.add(r.req_id)
+        if not poc_req_ids:
+            self._step = None
+            return
         # Deterministic order: nonce, not set-iteration (PYTHONHASHSEED).
         poc_requests = sorted(
             (self._reqs[rid] for rid in poc_req_ids if rid in self._reqs),

@@ -4,6 +4,8 @@
 The step policy that used to live here (mixing gate, token share, footprint)
 is gone: PoC rows are scheduled by vLLM like chat (ADR-0017)."""
 
+ADDITIONAL_CONFIG_KEY = "gonka_poc"
+
 
 def poc_is_pure_path(poc_params) -> bool:
     """True for prefill-only PoC (max_tokens == 0), which has no decode loop. All
@@ -11,11 +13,11 @@ def poc_is_pure_path(poc_params) -> bool:
     return poc_params.max_tokens == 0
 
 
-# PoC knobs live in our fork's CacheConfig. On a stock vLLM those attributes do
-# not exist and the plugin must still run — that is the point of shipping it as a
-# plugin — so every read goes through poc_cfg() and falls back to the SAME value
-# the fork declares. If a default drifts, consensus-relevant behaviour (seq_len,
-# max_tokens) would silently differ between a fork deploy and a stock deploy.
+# PoC knobs ride in vLLM's public ``--additional-config`` under the "gonka_poc"
+# key (``VllmConfig.additional_config``); the engine declares nothing for us.
+# Every read goes through poc_cfg() and falls back to the SAME default on any
+# tree, so consensus-relevant behaviour (seq_len, max_tokens) cannot drift
+# between deployments that pass the knob and ones that do not.
 POC_CONFIG_DEFAULTS = {
     # decode-state slots: 0 = max_num_seqs (vLLM never runs more rows than that)
     "poc_max_batch_size": 0,
@@ -25,8 +27,22 @@ POC_CONFIG_DEFAULTS = {
 }
 
 
-def poc_cfg(cache_config, name: str):
-    """Read a PoC knob from a CacheConfig that may not define it."""
+def poc_cfg(vllm_config, name: str):
+    """Read a PoC knob from ``vllm_config.additional_config["gonka_poc"]``.
+
+    Accepts ``None`` / any object without ``additional_config`` (tests, partial
+    runners) and returns the default. Values are coerced to the default's type
+    so ``--additional-config '{"gonka_poc": {"poc_max_batch_size": "512"}}'``
+    behaves like the integer form.
+    """
     if name not in POC_CONFIG_DEFAULTS:
         raise KeyError(f"unknown PoC config knob: {name}")
-    return getattr(cache_config, name, POC_CONFIG_DEFAULTS[name])
+    default = POC_CONFIG_DEFAULTS[name]
+    extra = getattr(vllm_config, "additional_config", None) or {}
+    section = extra.get(ADDITIONAL_CONFIG_KEY) if isinstance(extra, dict) else None
+    if not isinstance(section, dict) or name not in section:
+        return default
+    value = section[name]
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes")
+    return type(default)(value)

@@ -41,10 +41,9 @@ logger = init_logger(__name__)
 def _vector_artifact_cfg(runner) -> bool:
     """poc_vector_artifacts enabled? The dim is the PoC's own k_dim and the window
     is every step — no separate knobs (retired poc_vector_artifact_steps/_dim).
-    Fallback is load-bearing: overlaid onto trees whose config predates the field
-    → disable, don't raise."""
-    cc = getattr(getattr(runner, "vllm_config", None), "cache_config", None)
-    return bool(getattr(cc, "poc_vector_artifacts", False)) if cc is not None else False
+    Read from ``--additional-config`` (``gonka_poc.poc_vector_artifacts``);
+    absent → disabled."""
+    return bool(poc_cfg(getattr(runner, "vllm_config", None), "poc_vector_artifacts"))
 
 
 _EMIT_STAT = {"n": 0, "k": 0.0, "q": 0.0, "q_steps": 0}
@@ -226,12 +225,11 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     step emits a pure-path artifact instead of starting the chain."""
     mgr = getattr(runner, "_poc_mixed_decode_mgr", None)
     if mgr is None:
-        cc = runner.cache_config
         sc = runner.vllm_config.scheduler_config
         # State slots hold no KV. vLLM never runs more rows than max_num_seqs,
         # so a pool of that size cannot run out (a row without a slot would drop
         # its nonce); an explicit poc_max_batch_size is honoured verbatim.
-        configured = int(poc_cfg(cc, "poc_max_batch_size") or 0)
+        configured = int(poc_cfg(runner.vllm_config, "poc_max_batch_size") or 0)
         cap = configured or int(sc.max_num_seqs)
         logger.info("poc: decode-PoC state pool: %d slots (configured=%d, max_num_seqs=%d)",
                     cap, configured, sc.max_num_seqs)

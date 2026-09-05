@@ -58,8 +58,9 @@ the unscoped root. A new knob that changes the traced forward must be added to
 `_TRACED_KNOBS` there.
 
 `poc_max_batch_size` (decode-state slots, 0 = `max_num_seqs`), `poc_seq_len`, `poc_max_tokens`, `poc_vector_artifacts` are read
-through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI
-arguments for PoC. See [ADR-0017](docs/adr/ADR-0017-poc-scheduled-like-chat.md) (ADR-0016 is superseded).
+through `poc_cfg()` from vLLM's public `--additional-config '{"gonka_poc": {...}}'`
+(`VllmConfig.additional_config`), falling back to the plugin's own defaults; the
+residual declares no PoC configuration and carries no CLI arguments for PoC. See [ADR-0017](docs/adr/ADR-0017-poc-scheduled-like-chat.md) (ADR-0016 is superseded).
 
 ## Package layout
 

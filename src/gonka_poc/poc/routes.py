@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 import logging
+from gonka_poc.mixed.policy import poc_cfg
 from gonka_poc.poc.config import PoCState
 from gonka_poc.poc.data import (
     Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
@@ -76,7 +77,7 @@ def resolve_mining_round(configured: int, engine_client) -> int:
     """How many nonces continuous mining pulls per iteration.
 
     `configured` > 0 is honored verbatim. 0 = AUTO: ask the ENGINE how many PoC sequences
-    it can hold — poc_max_batch_size (itself resolved to max_num_seqs at startup), then
+    it can hold — poc_max_batch_size from ``--additional-config`` (gonka_poc), then
     max_num_seqs directly — so a bigger machine mines a bigger round instead of being
     pinned to a client-side constant. The literal fallback is last-resort ONLY and warns,
     because a silent constant here is exactly how PoC ended up throttled to 32 on every
@@ -84,9 +85,8 @@ def resolve_mining_round(configured: int, engine_client) -> int:
     if configured:
         return configured
     vc = getattr(engine_client, "vllm_config", None)
-    cc = getattr(vc, "cache_config", None)
     sc = getattr(vc, "scheduler_config", None)
-    resolved = getattr(cc, "poc_max_batch_size", 0) or getattr(sc, "max_num_seqs", 0)
+    resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
     if resolved:
         return resolved
     logger.warning("PoC mining: engine config unreadable, defaulting round to 32")

@@ -67,3 +67,24 @@ instead of 454; there is no decode-only mode, no Triton kernel, no KV-manager re
 the plugin. Chat next to PoC is governed by the client window: 256 with live chat, 512
 alone. Not yet measured on Hopper TP=4 after the removal (the Hopper livelock of ADR-0016
 lived in the decode-only mode, which no longer exists).
+
+## Addendum (2026-09-05) — seam surface, tier 1
+
+Two engine-side PoC fields turned out to be redundant and were removed without a
+behaviour change:
+
+- `SchedulerOutput.poc_req_ids` — the bridge keeps its own registry of PoC rows
+  (registered from `NewRequestData.poc_params`, dropped on `finished_req_ids`) and
+  intersects it with what the scheduler scheduled this step.
+- The four PoC knobs on `CacheConfig` (`poc_max_batch_size`, `poc_seq_len`,
+  `poc_max_tokens`, `poc_vector_artifacts`) — plain defaults with no CLI. They are now
+  read from vLLM's public `--additional-config '{"gonka_poc": {...}}'` with the same
+  defaults (`gonka_poc.mixed.policy.poc_cfg`).
+
+What remains engine-side after tier 1: `poc_params` on the request path
+(`EngineCoreRequest` → `Request` → `NewRequestData` → `CachedRequestState`), the
+`PoCOutput` / `poc_output` path back to the node with the emit-once finish, the sampler
+exclusion of PoC rows, and the five runner anchors. Folding those into public extension
+points (`SamplingParams.extra_args`, artifacts over `collective_rpc`, standard finish by
+`max_tokens`) is tier 2 and is deliberately not done here.
+

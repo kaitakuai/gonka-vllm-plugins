@@ -3,6 +3,19 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-05 — PoC knobs move from CacheConfig to `--additional-config`; `poc_req_ids` dropped
+
+Seam surface, tier 1. `SchedulerOutput.poc_req_ids` was redundant: the runner bridge
+already knows every PoC row from `NewRequestData.poc_params` and now intersects its own
+registry with the step's scheduled requests. The four PoC knobs on the fork's `CacheConfig`
+had no CLI and only ever held their defaults; they are read from vLLM's public
+`--additional-config '{"gonka_poc": {...}}'` instead, same defaults. `CacheConfig` and
+`SchedulerOutput` are back to stock (residual `vllm/` diff 35 → 34 files, −40 lines). No
+behaviour change; verified on 1×B300 against the post-removal numbers of ADR-0017. Tier 2
+(PoC as an ordinary request via `SamplingParams.extra_args`, artifacts over
+`collective_rpc`) is designed but not done. See
+[ADR-0017, addendum](adr/ADR-0017-poc-scheduled-like-chat.md).
+
 ## 2026-09-05 — PoC rows are scheduled like chat; the in-engine admission layer is gone
 
 The six Hopper fixes of ADR-0016 were patches inside `PoCAdmission`, the per-step PoC
