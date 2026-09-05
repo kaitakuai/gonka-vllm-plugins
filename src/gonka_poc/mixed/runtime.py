@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 import torch
 from vllm.logger import init_logger
 
+from gonka_poc.mixed.policy import poc_cfg
+
 logger = init_logger(__name__)
 
 # SNAP MARGIN (validator-side). Every teacher-forced disagreement is counted, and the
@@ -134,38 +136,6 @@ def slice_sampling_metadata(sm, rows, device):
 
 
 
-def poc_kv_capacity(num_gpu_blocks, block_size, seq_len: int,
-                    max_tokens: int) -> int:
-    """How many PoC nonces the KV pool can physically hold.
-
-    A nonce reserves its whole footprint (seq_len prefill + max_tokens decode)
-    for the entire trajectory, so admitting more than the pool fits livelocks:
-    every row needs its full allocation to progress, and preempting one to feed
-    another just cycles. Returns 0 when the pool size is not yet known (the
-    engine computes num_gpu_blocks from free memory AFTER config init), which
-    callers read as "no KV-derived bound available". Pure (unit-testable)."""
-    if not num_gpu_blocks or not block_size:
-        return 0
-    per_nonce = max(1, seq_len + max_tokens)
-    return int(num_gpu_blocks) * int(block_size) // per_nonce
-
-
-def resolve_poc_max_batch_size(configured: int, max_num_seqs: int,
-                               kv_capacity: int = 0) -> int:
-    """The per-step PoC nonce cap.
-
-    `configured` > 0 is honored verbatim. AUTO (0) takes the engine's own
-    concurrency limit, clamped by what the KV pool actually holds: max_num_seqs
-    is a scheduler knob with no memory awareness, and chat survives
-    oversubscription only because its requests grow token-by-token and can be
-    preempted — PoC's fixed upfront footprint cannot. Pure (unit-testable)."""
-    if configured:
-        return configured
-    if kv_capacity > 0:
-        return min(max_num_seqs, kv_capacity)
-    return max_num_seqs
-
-
 @dataclass
 class PoCDecodeState:
     """Per-request decode state, carried across scheduler steps."""
@@ -255,15 +225,13 @@ def get_decode_manager(runner) -> "PoCMixedDecodeManager":
     if mgr is None:
         cc = runner.cache_config
         sc = runner.vllm_config.scheduler_config
-        # State slots hold no KV: size the pool by max_num_seqs (or an explicit
-        # poc_max_batch_size) without the poc_kv_capacity clamp: under hybrid KV
-        # block_size comes from the smallest group and the formula undersizes the
-        # pool; a row without a slot silently drops its nonce. KV clamp: admission.py.
-        cap = resolve_poc_max_batch_size(cc.poc_max_batch_size, sc.max_num_seqs, 0)
-        logger.info("poc: decode-PoC state pool: %d slots (configured=%d, "
-                    "max_num_seqs=%d, num_gpu_blocks=%s, block_size=%s)",
-                    cap, cc.poc_max_batch_size, sc.max_num_seqs,
-                    getattr(cc, "num_gpu_blocks", None), getattr(cc, "block_size", None))
+        # State slots hold no KV. vLLM never runs more rows than max_num_seqs,
+        # so a pool of that size cannot run out (a row without a slot would drop
+        # its nonce); an explicit poc_max_batch_size is honoured verbatim.
+        configured = int(poc_cfg(cc, "poc_max_batch_size") or 0)
+        cap = configured or int(sc.max_num_seqs)
+        logger.info("poc: decode-PoC state pool: %d slots (configured=%d, max_num_seqs=%d)",
+                    cap, configured, sc.max_num_seqs)
         mgr = PoCMixedDecodeManager(cap)
         runner._poc_mixed_decode_mgr = mgr
     return mgr
@@ -318,14 +286,14 @@ def _cat_prev_k(states, where: str) -> "torch.Tensor":
     ``num_computed_tokens`` is advanced at schedule time, so it reads >= seq_len
     while the prefill forward is still in flight.
 
-    Reproduced only at poc_max_batch_size=1, where a nonce's prefill and its first
-    decode land in adjacent steps with nothing in between — a diagnostic setting,
-    not an operating mode. A scheduler-side gate to prevent it was written and then
-    removed: it covered the plain case but not the chunked one, and a half-working
-    prevention only makes a rare race rarer — harder to reproduce, harder to
-    diagnose — while adding cross-step state to the admission path. Detecting it
-    precisely is cheap and complete, so detection is what we keep: the batch fails
-    loudly, its nonces come back empty, and the corpus guard catches them.
+    The prefill snap that publishes prev_k runs in the worker's execute_model
+    (bridge.extract) before the next step's inputs are built, so this can only
+    trip when the nonce had no state slot at prefill time. The pool is sized by
+    max_num_seqs (see get_decode_manager), which vLLM never exceeds; the
+    scheduler-side one-step hold that used to guard this was removed on
+    2026-09-05 after window-1 stress runs (prefill and first decode in adjacent
+    steps) on B300 never tripped it. Detection stays: the batch fails loudly, its
+    nonces come back empty, and the corpus guard catches them.
 
     Substituting a placeholder here would be WORSE than failing: prev_k < 0 makes
     the embedding wrapper fall back to the prefill embed, so the nonce would keep

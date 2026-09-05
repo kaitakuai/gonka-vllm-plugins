@@ -16,7 +16,6 @@ import os
 
 import torch
 
-from gonka_poc.mixed import reflect_kernel as _reflect_kernel
 from torch import nn
 
 import logging
@@ -82,13 +81,11 @@ def _reflect_torch(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torc
 
 
 def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Reflection on PoC rows: fused Triton kernel (one pass per row) where
-    available, else the four-kernel reference. v: [n, *pad, hidden],
-    mask: [n, *pad, 1] — as fed by PoCLayerWrapper._apply."""
-    if x.is_cuda and _reflect_kernel.fused_enabled():
-        n = x.shape[0]
-        return _reflect_kernel.reflect_fused(
-            x, v.reshape(n, -1), mask.reshape(n))
+    """Reflection on PoC rows — the reference path, and the only path: the
+    reflection is consensus math, and an explicit torch expression behaves the
+    same on every node (a fused Triton variant was removed on 2026-09-05: it
+    sped PoC up ~12% on Hopper, did nothing for inference and rounded
+    differently per architecture). v: [n, *pad, hidden], mask: [n, *pad, 1]."""
     return _reflect_torch(x, v, mask)
 
 
@@ -681,15 +678,6 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     _mt = getattr(hf_config, "model_type", None)
     logger.info("PoC seeded-routing ladder base: %d (model_type=%s)",
                 set_ladder_base_for_model(_mt), _mt)
-    # The fused reflect JIT-compiles on first call; do it here, before CUDA-graph
-    # capture, so the JIT does not land inside the capture.
-    try:
-        _fused = _reflect_kernel.warmup(hidden_size, device, dtype)
-    except Exception as e:  # noqa: BLE001 — fall back to reference, not a crash
-        logger.warning("PoC fused reflect: warmup failed (%r), reference path", e)
-        os.environ["POC_FUSED_REFLECT"] = "0"
-        _fused = False
-    logger.info("PoC reflect: %s", "fused Triton" if _fused else "4-kernel reference")
     vocab = int(getattr(hf_config, "vocab_size", 0) or 0)
     if vocab and not _ablated("pseudo"):
         state.token_id_vocab = vocab

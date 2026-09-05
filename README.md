@@ -16,8 +16,8 @@ The engine resolves between them at import time (`vllm/poc/dispatch.py` on
 the branch): plugin when installed, in-tree otherwise. The boot log states
 which is active.
 
-The engine itself carries a small set of committed seams (scheduler
-admission, request-field plumbing, runner hooks, entry/exit, config knobs)
+The engine itself carries a small set of committed seams (one scheduler
+hook for the atomic PoC prefill, request-field plumbing, runner hooks, entry/exit, config knobs)
 — no runtime monkeypatching. `residual/README.md` documents each seam and
 why it cannot live in the plugin; `residual/v0_25_mixed_seams.patch` is the
 full diff against upstream vLLM v0.25.1.
@@ -46,27 +46,20 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `POC_MIXED_BATCH` | on | PoC prefill may share a step with decode rows, as chat is scheduled. `0` restores decode-only steps (a step is either prefill or decode). |
-| `POC_KV_HEADROOM` | `0.01` | fraction of the KV pool kept free when admitting PoC prefills (plus one block per running row). |
-| `POC_FUSED_REFLECT` | `1` | Triton one-pass Householder reflection; `0` restores the four-kernel reference path. |
-| `POC_ROLLING_WINDOW` / `POC_ROLLING_REFILL` | off | client-side rolling admission: window of concurrent nonces and how many are admitted together once that many slots free up. |
-| `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_MIXED_BATCH`). |
-| `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
+| `POC_ROLLING_WINDOW` / `POC_ROLLING_REFILL` | `256` / window÷4 | the node's only PoC scheduling knob: how many nonces of a round are in flight at once, and how many are launched together as slots free up. `0` = every nonce at once. 256 keeps live chat healthy (05.09, B300: chat c=256 15.5 req/s next to PoC vs 10.2 with the old in-engine share); alone, 512 saturates the GPU. |
+| `POC_DIAG` | off | per-step forward GPU/host timing (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
-| `POC_PREFILL_LANDING_HOLD` | `1` | hold a nonce's first decode row one step after its prefill (e2bb23a). `0` removes the hold (experiment of 2026-09-05; `_cat_prev_k` still fails loudly if a decode row has no prev_k). |
-| `POC_ENGINE_ADMISSION` | `full` | `minimal`: no per-step PoC policy in the scheduler (no row cap, share, KV headroom, stall hand-off or decode-only isolation) — vLLM schedules PoC rows like chat; only the all-or-nothing prefill and the one-step prefill-landing hold remain. Experiment of 2026-09-05; pair it with `POC_ROLLING_WINDOW` on the client. |
 
-`POC_FUSED_REFLECT`, `POC_ABLATE` and `VLLM_POC_DEBUG_TP` change the traced forward,
-and vLLM's compile-cache key hashes the traced source and the config, not the
-environment. The plugin therefore scopes `VLLM_CACHE_ROOT` to a knob-specific
+`POC_ABLATE` and `VLLM_POC_DEBUG_TP` change the traced forward, and vLLM's compile-cache
+key hashes the traced source and the config, not the environment. The plugin therefore scopes `VLLM_CACHE_ROOT` to a knob-specific
 sub-directory (`gonka-poc-knobs-<hash>`) whenever one of them is set away from its
 default, in every process, before anything compiles (`compile_cache.py`). Defaults keep
 the unscoped root. A new knob that changes the traced forward must be added to
 `_TRACED_KNOBS` there.
 
-`poc_max_batch_size`, `poc_share`, `poc_seq_len`, `poc_max_tokens` are read
+`poc_max_batch_size` (decode-state slots, 0 = `max_num_seqs`), `poc_seq_len`, `poc_max_tokens`, `poc_vector_artifacts` are read
 through `poc_cfg()` with the plugin's own defaults; the residual carries no CLI
-arguments for PoC. See [ADR-0016](docs/adr/ADR-0016-hopper-admission-and-fused-reflection.md).
+arguments for PoC. See [ADR-0017](docs/adr/ADR-0017-poc-scheduled-like-chat.md) (ADR-0016 is superseded).
 
 ## Package layout
 
@@ -75,7 +68,7 @@ src/gonka_poc/
   poc/          consensus core + API: seeds/inputs (gpu_random), sphere
                 codebook + snap, artifacts + fraud test (data, validation),
                 routes, generate_queue, callbacks
-  mixed/        engine-facing seam counterparts: admission (scheduler),
+  mixed/        engine-facing seam counterparts: poc_step_tokens (scheduler),
                 bridge (model runners, V1 + V2), runtime (decode chain +
                 emit-once), native (in-graph transforms: seeded embeddings,
                 Householder reflections, seeded MoE routing, sphere snap;

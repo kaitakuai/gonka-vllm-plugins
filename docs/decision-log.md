@@ -3,6 +3,23 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-05 — PoC rows are scheduled like chat; the in-engine admission layer is gone
+
+The six Hopper fixes of ADR-0016 were patches inside `PoCAdmission`, the per-step PoC
+policy ported from the 0.20 in-tree branch (row cap, token share, KV headroom gate, stall
+hand-off, decode-only isolation, first-decode hold). Vlad's point held: the layer created
+the problems it solved, because a round was dumped into the scheduler in one go and then
+metered by hand. Measured on 1×B300 with the layer bypassed and the hold removed: verdict
+unchanged (DeepSeek goldens at τ=0.05 and 42 MiniMax cells within noise), PoC alone
+31.7 vs 31.8 nonce/s, PoC next to chat 84 s / 15.5 req/s vs 86 s / 10.2 with the layer
+(client window 256), no preemptions, no prev_k race even at window 1.
+
+Removed: `PoCAdmission` and four of the five scheduler hooks (one `poc_step_tokens` call
+remains: atomic PoC prefill, one token per decode step), decode-only steps, the KV
+headroom gate, `poc_share`, the fused Triton reflection, the admission diagnostics, and the
+experiment knobs. `POC_ROLLING_WINDOW` (default 256) is the node's PoC scheduling knob.
+See [ADR-0017](adr/ADR-0017-poc-scheduled-like-chat.md).
+
 ## 2026-09-04 — Consensus constants in traced code change only through source
 
 A ladder-base experiment on 1×B300 (MiniMax-M2.7: boot with `POC_LADDER_BASE=100`, then

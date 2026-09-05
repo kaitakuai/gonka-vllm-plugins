@@ -64,19 +64,23 @@ def _server_gpu() -> str:
 
 
 
-def _rolling_window(total_nonces: int) -> int:
-    """Rolling admission window size; 0 = off (admit everything at once).
+POC_ROLLING_WINDOW_DEFAULT = 256
 
-    POC_ROLLING_WINDOW: >0 — explicit window; 0/empty — off; "auto" — 256. The
-    plugin does not know the measured KV capacity limit, so auto picks a
-    conservative value: below any measured limit, yet enough to keep the engine
-    fed (throughput saturates around 256-512 concurrent nonces).
+
+def _rolling_window(total_nonces: int) -> int:
+    """How many nonces of a round are in flight at once (client-side concurrency).
+
+    This is the node's only PoC scheduling knob: the engine schedules PoC rows
+    like chat (ADR-0017), so the window is what keeps a round from occupying the
+    whole batch. POC_ROLLING_WINDOW: >0 — explicit; empty/"auto" — 256 (measured
+    05.09 on B300: with live chat at c=256 it beats the old in-engine share on
+    both sides; alone, 512 saturates the GPU); 0 — off, every nonce at once.
     """
     raw = os.environ.get("POC_ROLLING_WINDOW", "").strip().lower()
-    if not raw or raw == "0":
+    if raw == "0":
         return 0
-    if raw == "auto":
-        return min(256, max(1, total_nonces))
+    if not raw or raw == "auto":
+        return min(POC_ROLLING_WINDOW_DEFAULT, max(1, total_nonces))
     try:
         w = int(raw)
     except ValueError:
@@ -92,11 +96,7 @@ def _rolling_refill(window: int) -> int:
     raw = os.environ.get("POC_ROLLING_REFILL", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return min(int(raw), window)
-    # Mixed batches: admit one nonce at a time. No decode-only isolation, so a
-    # prefill in every step does not stop decode.
-    if os.environ.get("POC_MIXED_BATCH", "").strip() in ("1", "true", "yes"):
-        return 1
-    return max(16, min(window, window // 4))
+    return max(1, min(window, window // 4))
 
 
 async def _run_rolling(compute_one, nonces, window: int, refill: int):
@@ -261,9 +261,9 @@ async def compute_nonce_artifacts(
             _inflight.discard(request_id)
         return None
 
-    # Rolling admission: the window caps concurrency, the refill is how many
-    # nonces are admitted at once (one at a time starves decode under
-    # decode-only steps). POC_ROLLING_WINDOW=0 (default) = all-at-once admission.
+    # Client-side concurrency: the window caps in-flight nonces, the refill is
+    # how many are launched at once as slots free up. POC_ROLLING_WINDOW=0 = all
+    # at once (the engine then queues them like a burst of chat requests).
     window = _rolling_window(len(nonces))
     if window and len(nonces) > window:
         refill = _rolling_refill(window)
@@ -493,8 +493,8 @@ class GenerateQueue:
         """Process a single generate job."""
         total_nonces = len(job.nonces)
         # batch_size 0 = no client-side chunking: submit every nonce at once and let the
-        # ENGINE batch them (capped per step by poc_max_batch_size, which auto-scales to
-        # max_num_seqs). Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
+        # ENGINE schedule them like chat; the rolling window above caps in-flight
+        # nonces. Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
         # nonces to the chunk size no matter what the engine can serve.
         step = job.batch_size or total_nonces
         n_chunks = (total_nonces + step - 1) // step
