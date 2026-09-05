@@ -101,3 +101,49 @@ def test_skipped_waiting_is_scanned():
     skipped = [Req("w0", True, computed=0)]
     a = PoCAdmission(make_sched(running=running, skipped=skipped, free=100000), token_budget=16384)
     assert a._poc_prefill                            # skipped_waiting prefill is seen
+
+
+def test_minimal_mode_leaves_scheduling_to_vllm(monkeypatch):
+    """POC_ENGINE_ADMISSION=minimal: no row cap, no share, no KV headroom, no
+    decode-only isolation; chat is never deferred. What stays: the all-or-nothing
+    prefill (step-budget guard) and the one-step hold of a nonce's first decode
+    row until its prefill output has landed."""
+    monkeypatch.setenv("POC_ENGINE_ADMISSION", "minimal")
+    monkeypatch.setenv("POC_KV_HEADROOM", "0.0")
+    monkeypatch.setenv("POC_MIXED_BATCH", "0")          # ignored in minimal mode
+    chat = [Req(f"c{i}", False, computed=300) for i in range(256)]
+    poc = [Req(f"p{i}", True, computed=300) for i in range(600)]
+    waiting = [Req(f"w{i}", True, computed=0) for i in range(40)]
+    s = make_sched(running=chat + poc, waiting=waiting, free=50)   # pool nearly full
+    a = PoCAdmission(s, token_budget=16384)
+    assert a.active
+    # no cap (600 PoC rows on a 512 graph) and no decode-only isolation
+    for r in poc:
+        assert not a.skip(r)
+        a.note_scheduled(r, 1)
+    assert a._scheduled == 600
+    # no headroom gate: waiting prefills are not held back by a full pool
+    assert not a.skip(waiting[0])
+    # chat is never deferred
+    for r in chat:
+        assert not a.skip(r)
+    # all-or-nothing prefill: num_tokens is seq_len and the step budget still guards
+    assert a.num_tokens(waiting[0], 100) == 256
+    assert not a.over_budget(waiting[0], 256)
+    a.note_scheduled(waiting[0], 256)
+    assert a.over_budget(waiting[1], 16384)             # would exceed the whole step
+    # landing hold: the row whose prefill completed this step is held next step, once
+    assert waiting[0].request_id in s._poc_prefill_landing
+    waiting[0].num_computed_tokens = 256
+    b = PoCAdmission(s, token_budget=16384)
+    assert b.skip(waiting[0])
+    c = PoCAdmission(s, token_budget=16384)
+    assert not c.skip(waiting[0])
+
+
+def test_full_mode_is_the_default(monkeypatch):
+    monkeypatch.delenv("POC_ENGINE_ADMISSION", raising=False)
+    from gonka_poc.mixed.admission import admission_mode
+    assert admission_mode() == "full"
+    monkeypatch.setenv("POC_ENGINE_ADMISSION", "MINIMAL")
+    assert admission_mode() == "minimal"

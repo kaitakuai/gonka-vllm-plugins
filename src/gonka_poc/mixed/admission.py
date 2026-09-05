@@ -17,6 +17,7 @@ Policy (ported from the 0.20 in-tree branch, ``vllm/poc/mixed_decode.py``):
     starve a decoding PoC.
 """
 
+import os
 from typing import TYPE_CHECKING
 
 from gonka_poc.mixed.policy import (
@@ -35,6 +36,17 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def admission_mode() -> str:
+    """``POC_ENGINE_ADMISSION``: ``full`` (default) keeps the per-step PoC policy
+    ported from the 0.20 in-tree branch; ``minimal`` hands scheduling to vLLM
+    itself (max_num_seqs, token budget, KV, priority) and keeps only what a PoC
+    row structurally needs — see ``PoCAdmission.__init__``. Experiment of
+    2026-09-05 ("PoC scheduled like chat"); concurrency then lives on the client
+    (``POC_ROLLING_WINDOW``)."""
+    v = os.environ.get("POC_ENGINE_ADMISSION", "full").strip().lower()
+    return "minimal" if v == "minimal" else "full"
 
 
 def _pool_diag(scheduler) -> str:
@@ -234,6 +246,33 @@ class PoCAdmission:
         if not self.active:
             return
 
+        if admission_mode() == "minimal":
+            # No PoC admission policy: no row cap, no share, no KV headroom, no
+            # stall hand-off, no decode-only isolation — vLLM's scheduler decides.
+            # Two things stay because a PoC row is not a chat row: its prefill is
+            # all-or-nothing (seq_len tokens that must fit the step, num_tokens /
+            # over_budget) and its first decode row waits one step for the prefill
+            # output to land (prev_k, e2bb23a) — skip() via _prefill_landing.
+            self._max_batch = 1 << 30
+            self._token_budget = int(token_budget)
+            self._step_budget = int(token_budget)
+            self._scheduled = self._tokens = self._any_scheduled = 0
+            self._new_prefills = self._all_tokens = 0
+            self._prefill_allow = None
+            self._stalled = False
+            self._poc_prefill = poc_will_prefill
+            self._defer_chat = self._defer_poc = False
+            self._scheduler = scheduler
+            self._prefill_landing = getattr(scheduler, "_poc_prefill_landing", None) or set()
+            scheduler._poc_prefill_landing = set()
+            scheduler._poc_admission = self
+            if not getattr(scheduler, "_poc_minimal_logged", False):
+                scheduler._poc_minimal_logged = True
+                logger.info("poc: engine admission MINIMAL — vLLM schedules PoC rows "
+                            "like chat; only all-or-nothing prefill and the one-step "
+                            "prefill landing hold remain")
+            return
+
         _install_alloc_diag(scheduler)
         _prev = getattr(scheduler, "_poc_admission", None)
         if (_prev is not None and _prev.active and poc_will_prefill
@@ -406,7 +445,7 @@ class PoCAdmission:
             return True
         # Mixed batches: PoC prefill and decode rows share the step. Otherwise
         # decode-only steps (a pure decode step lands on a captured CUDA graph).
-        if poc_mixed_batch():
+        if poc_mixed_batch() or admission_mode() == "minimal":
             return False
         # Keep a step uniform: never mix a PoC prefill with PoC decode rows.
         return self._poc_prefill and request.num_computed_tokens > 0
