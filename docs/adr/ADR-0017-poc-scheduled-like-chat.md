@@ -44,19 +44,21 @@ go (`asyncio.gather` over every nonce) and the layer then metered it.
 
 ## Evidence (1×B300, 05.09; τ = 0 / 0.02 / 0.05 / 0.1)
 
-| cell | with the layer | without the layer, no hold |
-| --- | --- | --- |
-| golden NVFP4 → validator | 1.81 / 0.034 / 0.0049 / 0.0003 (manifest) | 7.82 / 0.096 / 0.0055 / 0.0003 |
-| golden REAP (fraud) → validator | 41.95 / 16.57 / 3.40 / 0.16 | 41.85 / 16.49 / 3.39 / 0.15 |
-| MiniMax, 42 golden cells vs the frozen reference | \|z\| ≤ 3.2, median 0.7 | \|z\| ≤ 3.3, median 0.7 |
-| PoC 3000 nonces alone | 31.8 nonce/s | 31.7 nonce/s (window 512) |
-| PoC 1500 next to chat c=256 | 86 s / chat 10.2 req/s | 84 s / chat 15.5 req/s (window 256) |
-| window 1 (prefill and first decode in adjacent steps), 40 nonces | — | 40/40, engine alive, self-validation bit-exact |
-| 1000 nonces at once on MiniMax (KV 322k) | — | 1000/1000, 0 preemptions |
+| cell | with the layer | layer bypassed, hold off (still fused) | after the removal (this code) |
+| --- | --- | --- | --- |
+| golden NVFP4 → validator | 1.81 / 0.034 / 0.0049 / 0.0003 (manifest) | 7.82 / 0.096 / 0.0055 / 0.0003 | 8.62 / 0.14 / 0.0058 / 0 |
+| golden REAP (fraud) → validator | 41.95 / 16.57 / 3.40 / 0.16 | 41.85 / 16.49 / 3.39 / 0.15 | 41.85 / 16.48 / 3.35 / 0.15 |
+| MiniMax, 42 golden cells vs the frozen reference | \|z\| ≤ 3.2, median 0.7 | \|z\| ≤ 3.3, median 0.7 | \|z\| ≤ 1.1, median 0.4 |
+| PoC 3000 nonces alone | 31.8 nonce/s | 31.7 nonce/s (window 512) | 26.6 nonce/s (window 512; the reference reflection costs 16% on B300) |
+| PoC 1500 next to chat c=256 | 86 s / chat 10.2 req/s | 84 s / chat 15.5 req/s (window 256) | 97 s / chat 13.2 req/s (default window 256) |
+| window 1 (prefill and first decode in adjacent steps), 40 nonces | — | 40/40, engine alive, self-validation bit-exact | — |
+| 1000 nonces at once on MiniMax (KV 322k) | — | 1000/1000, 0 preemptions | — |
 
 At τ=0.05 the verdict is unchanged; at τ=0 the DeepSeek self-noise rises (the first decode
 step now runs in a prefill-composition step), which the DeepSeek threshold (τ=0.05) does
-not see and the MiniMax cells (τ=0) did not register.
+not see and the MiniMax cells (τ=0) did not register. With the reference reflection the
+MiniMax cells sit closer to the frozen reference than the fused kernel ever did
+(rh200_honest_h01 7.04 vs 7.04 frozen; the fused path read 7.20–7.24).
 
 ## Consequences
 
