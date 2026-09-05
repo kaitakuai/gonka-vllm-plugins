@@ -81,6 +81,13 @@ behaviour change:
   read from vLLM's public `--additional-config '{"gonka_poc": {...}}'` with the same
   defaults (`gonka_poc.mixed.policy.poc_cfg`).
 
+Verified on 1×B300 (05.09, fresh compile cache) against the post-removal column above:
+golden NVFP4 8.59 / 0.139 / 0.0058 / 0, golden REAP 41.85 / 16.47 / 3.35 / 0.15, PoC 3000
+nonces 27.3 nonce/s (window 512), PoC 1500 next to chat 97 s / 13.2 req/s (window 256), the
+42 MiniMax golden cells |z| ≤ 1.1 with a median absolute difference to the previous run of
+0.006 pp; decode-state pool 1024 (DeepSeek) and 704 (MiniMax) resolved from `max_num_seqs`
+through `additional_config` defaults.
+
 What remains engine-side after tier 1: `poc_params` on the request path
 (`EngineCoreRequest` → `Request` → `NewRequestData` → `CachedRequestState`), the
 `PoCOutput` / `poc_output` path back to the node with the emit-once finish, the sampler
