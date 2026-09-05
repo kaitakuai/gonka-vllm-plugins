@@ -53,6 +53,7 @@ PoC API: `POST /api/v1/pow/generate` (see `src/gonka_poc/poc/routes.py`).
 | `POC_PREFILL_PER_STEP` | `0` | at most k new PoC prefills per step (meaningful with `POC_MIXED_BATCH`). |
 | `POC_DIAG` | off | step-interval histograms with composition, stall/alloc pool dumps, phase timers (diagnostics only). |
 | `POC_ABLATE` | off | `reflect,router,pseudo` — disable PoC interventions for diagnosis; not a consensus mode. |
+| `POC_PREFILL_LANDING_HOLD` | `1` | hold a nonce's first decode row one step after its prefill (e2bb23a). `0` removes the hold (experiment of 2026-09-05; `_cat_prev_k` still fails loudly if a decode row has no prev_k). |
 | `POC_ENGINE_ADMISSION` | `full` | `minimal`: no per-step PoC policy in the scheduler (no row cap, share, KV headroom, stall hand-off or decode-only isolation) — vLLM schedules PoC rows like chat; only the all-or-nothing prefill and the one-step prefill-landing hold remain. Experiment of 2026-09-05; pair it with `POC_ROLLING_WINDOW` on the client. |
 
 `POC_FUSED_REFLECT`, `POC_ABLATE` and `VLLM_POC_DEBUG_TP` change the traced forward,

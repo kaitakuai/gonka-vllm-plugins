@@ -38,6 +38,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def landing_hold() -> bool:
+    """``POC_PREFILL_LANDING_HOLD`` (default on): hold a nonce's first decode row
+    for one step after its prefill (e2bb23a). ``0`` removes the hold — experiment
+    of 2026-09-05: the prefill snap (k0 -> prev_k) is computed in the worker's
+    execute_model before the next step's inputs are built, so the hold should be
+    redundant whenever a state slot exists at prefill time (minimal mode sizes the
+    pool by max_num_seqs). ``_cat_prev_k`` still fails loudly if a row ever reaches
+    decode without prev_k."""
+    return os.environ.get("POC_PREFILL_LANDING_HOLD", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def admission_mode() -> str:
     """``POC_ENGINE_ADMISSION``: ``full`` (default) keeps the per-step PoC policy
     ported from the 0.20 in-tree branch; ``minimal`` hands scheduling to vLLM
@@ -269,8 +280,8 @@ class PoCAdmission:
             if not getattr(scheduler, "_poc_minimal_logged", False):
                 scheduler._poc_minimal_logged = True
                 logger.info("poc: engine admission MINIMAL — vLLM schedules PoC rows "
-                            "like chat; only all-or-nothing prefill and the one-step "
-                            "prefill landing hold remain")
+                            "like chat; all-or-nothing prefill kept, prefill landing "
+                            "hold %s", "on" if landing_hold() else "OFF")
             return
 
         _install_alloc_diag(scheduler)
@@ -441,7 +452,7 @@ class PoCAdmission:
                                   and self._new_prefills >= self._prefill_allow)):
             return True
         # This row's prefill landed last step; its output is still in flight.
-        if getattr(request, "request_id", None) in self._prefill_landing:
+        if landing_hold() and getattr(request, "request_id", None) in self._prefill_landing:
             return True
         # Mixed batches: PoC prefill and decode rows share the step. Otherwise
         # decode-only steps (a pure decode step lands on a captured CUDA graph).

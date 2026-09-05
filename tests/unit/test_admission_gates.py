@@ -147,3 +147,16 @@ def test_full_mode_is_the_default(monkeypatch):
     assert admission_mode() == "full"
     monkeypatch.setenv("POC_ENGINE_ADMISSION", "MINIMAL")
     assert admission_mode() == "minimal"
+
+
+def test_landing_hold_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("POC_ENGINE_ADMISSION", "minimal")
+    monkeypatch.setenv("POC_PREFILL_LANDING_HOLD", "0")
+    waiting = [Req("w0", True, computed=0)]
+    s = make_sched(waiting=waiting)
+    a = PoCAdmission(s, token_budget=16384)
+    assert not a.skip(waiting[0]); a.note_scheduled(waiting[0], 256)
+    assert waiting[0].request_id in s._poc_prefill_landing
+    waiting[0].num_computed_tokens = 256
+    b = PoCAdmission(s, token_budget=16384)
+    assert not b.skip(waiting[0])            # no hold: decode may follow the prefill at once
