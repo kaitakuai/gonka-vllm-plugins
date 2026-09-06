@@ -531,13 +531,20 @@ def execute_poc_forward(
         finally:
             native.set_mask(None)
     else:
+        # DIAGNOSTIC (POC_PREFILL_NOREFLECT=1): eager forward without the layer
+        # reflections, to measure pure eager-vs-compiled numerics against a
+        # compiled boot with POC_ABLATE=reflect. Never for real artifacts.
+        import contextlib, os
+        _refl_ctx = (contextlib.nullcontext()
+                     if os.environ.get("POC_PREFILL_NOREFLECT") == "1"
+                     else poc_forward_context())
         with set_forward_context(
             attn_metadata, vllm_config,
             num_tokens=batch_size * seq_len,
             slot_mapping=slot_mapping_dict,
             skip_compiled=True,
         ):
-            with poc_forward_context():
+            with _refl_ctx:
                 hidden_states = model(
                     input_ids=poc_input_ids,
                     positions=positions,
