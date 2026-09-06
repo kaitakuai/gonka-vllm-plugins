@@ -505,11 +505,15 @@ def execute_poc_forward(
         native.set_embeds(inputs_embeds.view(n_tok, hidden_size))
         native.set_row_block_hashes([block_hash] * n_tok)
         native.set_decode_chain()
-        # Same pseudo token ids as the eager scheme feeds (the embedding wrapper
-        # substitutes them for masked rows).
+        # The eager scheme feeds input_ids=None on every architecture except
+        # hash-MoE (excluded above): token ids do not reach the model there.
+        # The compiled forward needs a tensor; the embedding wrapper swaps the
+        # masked rows' ids for the (zeroed) pseudo-id buffer and their embeds
+        # for the buffer, so zeros are equivalent to None.
+        ids = (poc_input_ids.view(-1) if poc_input_ids is not None
+               else torch.zeros(n_tok, dtype=torch.int64, device=device))
         native.set_prefill_token_ids(
-            torch.arange(n_tok, dtype=torch.int64, device=device),
-            poc_input_ids.view(-1))
+            torch.arange(n_tok, dtype=torch.int64, device=device), ids)
         native.set_mask(torch.ones(n_tok, dtype=torch.bool, device=device),
                         route=False)
         try:
@@ -519,7 +523,7 @@ def execute_poc_forward(
                 slot_mapping=slot_mapping_dict,
             ):
                 hidden_states = model(
-                    input_ids=poc_input_ids,
+                    input_ids=ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=None,
