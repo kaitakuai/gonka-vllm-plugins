@@ -15,6 +15,8 @@ endpoint, which is why this is a launch flag.
 import logging
 from typing import Any, Dict, List, Optional
 
+from gonka_poc._compat import current as _compat_current
+
 logger = logging.getLogger(__name__)
 
 POC_RPC_TIMEOUT_MS = 60000
