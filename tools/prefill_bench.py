@@ -81,7 +81,9 @@ def main():
         for b in BATCHES:
             rates, utils = [], []
             for rep in range(REPEATS):
-                base = 1_000_000 * (BATCHES.index(b) + 1) + rep * NONCES
+                # nonce ranges depend on the batch size only, so runs with
+                # different BATCHES lists stay comparable (same nonces per batch)
+                base = 1_000_000 * b + rep * NONCES
                 gpu = GpuSampler(); gpu.start()
                 n, dt, data = generate(range(base, base + NONCES), b)
                 util = gpu.stop()
