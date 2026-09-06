@@ -302,6 +302,15 @@ def _select_poc_kv_scratch(
 _COMPILED_PREFILL_LOGGED = {"on": False, "off": None}
 
 
+def _token_id_routed(worker) -> bool:
+    """Models whose MoE gates pick experts by token id (hash-MoE); pseudo token
+    ids alone (``token_id_vocab``) are enabled on every model and are not the
+    marker."""
+    from gonka_poc.mixed.native import _TOKEN_ID_ROUTED_MODELS
+    hf = getattr(worker.model_config, "hf_config", None)
+    return getattr(hf, "model_type", None) in _TOKEN_ID_ROUTED_MODELS
+
+
 def _compiled_prefill_native(worker, kv_scratch, inputs_embeds, n_tok, pp_group):
     """The in-model PoC state when the compiled prefill experiment applies, else None.
 
@@ -320,7 +329,7 @@ def _compiled_prefill_native(worker, kv_scratch, inputs_embeds, n_tok, pp_group)
         why = "KV-scratch embeds path selected (bf16 KV): the eager scheme is the fleet's"
     elif inputs_embeds is None or pp_group.world_size > 1:
         why = "pipeline parallel"
-    elif getattr(native, "token_id_vocab", 0):
+    elif _token_id_routed(worker):
         why = "token-id routed model (hash-MoE)"
     elif n_tok > native.max_tokens:
         why = f"batch of {n_tok} tokens exceeds the state buffers ({native.max_tokens})"
@@ -496,6 +505,11 @@ def execute_poc_forward(
         native.set_embeds(inputs_embeds.view(n_tok, hidden_size))
         native.set_row_block_hashes([block_hash] * n_tok)
         native.set_decode_chain()
+        # Same pseudo token ids as the eager scheme feeds (the embedding wrapper
+        # substitutes them for masked rows).
+        native.set_prefill_token_ids(
+            torch.arange(n_tok, dtype=torch.int64, device=device),
+            poc_input_ids.view(-1))
         native.set_mask(torch.ones(n_tok, dtype=torch.bool, device=device),
                         route=False)
         try:
