@@ -69,6 +69,8 @@ async def execute_poc_forward_rpc(
             logger.warning("PoC pre-chunk abort failed: %s", exc)
 
     timeout_sec = timeout_ms / 1000.0
+    import os, time
+    _t0 = time.perf_counter() if os.environ.get("POC_DIAG") == "1" else None
     results = await engine_client.collective_rpc(
         "execute_poc_forward",
         timeout=timeout_sec,
@@ -85,6 +87,10 @@ async def execute_poc_forward_rpc(
                 int(lease["blocks_per_seq"]) if lease else None),
         },
     )
+
+    if _t0 is not None:
+        logger.info("poc prefill diag rpc: nonces=%d wall=%.1f ms",
+                    len(nonces), (time.perf_counter() - _t0) * 1e3)
 
     # Aggregate per-rank artifacts. In a PP topology only the last rank
     # populates artifacts; in TP-only it's typically the driver rank

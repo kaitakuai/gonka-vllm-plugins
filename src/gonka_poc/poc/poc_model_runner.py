@@ -59,6 +59,12 @@ logger = init_logger(__name__)
 
 DEFAULT_K_DIM = 12
 
+
+def _poc_diag() -> bool:
+    """POC_DIAG=1: log per-section timings of the prefill forward (diagnostic)."""
+    import os
+    return os.environ.get("POC_DIAG", "") == "1"
+
 # NOTE: attention metadata must NOT be cached across PoC calls.
 # The metadata builder's internal state (workspace buffers, page-table
 # references) is mutated by every inference engine step.  Reusing a
@@ -358,6 +364,10 @@ def execute_poc_forward(
     if tp_group.world_size > 1:
         dist.barrier(group=tp_group.cpu_group)
     torch.cuda.synchronize()
+    _diag = _poc_diag()
+    if _diag:
+        import time as _time
+        _t0 = _time.perf_counter()
 
     _ensure_layer_hooks(worker, block_hash, hidden_size)
 
@@ -374,6 +384,8 @@ def execute_poc_forward(
 
     poc_input_ids = _generate_poc_input_ids(
         block_hash, public_key, nonces, seq_len, worker, device)
+    if _diag:
+        torch.cuda.synchronize(); _t_meta = _time.perf_counter()
 
     # Generate inputs for all nonces at once
     intermediate_tensors = None
@@ -432,6 +444,8 @@ def execute_poc_forward(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
         )
 
+    if _diag:
+        torch.cuda.synchronize(); _t_emb = _time.perf_counter()
     with set_forward_context(
         attn_metadata, vllm_config,
         num_tokens=batch_size * seq_len,
@@ -445,6 +459,9 @@ def execute_poc_forward(
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
             )
+
+    if _diag:
+        torch.cuda.synchronize(); _t_fwd = _time.perf_counter()
 
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
@@ -490,6 +507,15 @@ def execute_poc_forward(
 
     # Convert to FP16
     vectors_f16 = yk.half().cpu().numpy()  # [batch_size, k_dim]
+
+    if _diag:
+        _t_ext = _time.perf_counter()
+        logger.info(
+            "poc prefill diag: batch=%d tokens=%d meta=%.1f embeds=%.1f forward=%.1f "
+            "extract=%.1f total=%.1f ms",
+            batch_size, batch_size * seq_len, (_t_meta - _t0) * 1e3,
+            (_t_emb - _t_meta) * 1e3, (_t_fwd - _t_emb) * 1e3,
+            (_t_ext - _t_fwd) * 1e3, (_t_ext - _t0) * 1e3)
 
     # Late NaN check after FP16 conversion
     nan_out = np.isnan(vectors_f16).any(axis=1)
