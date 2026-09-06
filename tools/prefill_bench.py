@@ -35,10 +35,10 @@ class GpuSampler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.samples = []
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 out = subprocess.check_output(
                     ["nvidia-smi", "--query-gpu=utilization.gpu",
@@ -46,10 +46,10 @@ class GpuSampler(threading.Thread):
                 self.samples.append(float(out.split("\n")[0].strip()))
             except Exception:
                 pass
-            self._stop.wait(0.5)
+            self._stop_evt.wait(0.5)
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=5)
         return statistics.mean(self.samples) if self.samples else float("nan")
 
