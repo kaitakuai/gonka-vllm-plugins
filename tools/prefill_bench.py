@@ -87,6 +87,12 @@ def main():
                 util = gpu.stop()
                 rate = n / dt if dt else 0.0
                 rates.append(rate); utils.append(util)
+                if rep == 0:
+                    # keep the vectors of the first repeat for a parity check
+                    # between two server modes (tools/prefill_compare.py)
+                    arts = data.get("artifacts") or data.get("results") or []
+                    with open(out_path + f".b{b}.artifacts.json", "w") as af:
+                        json.dump({str(a["nonce"]): a.get("vector_b64", "") for a in arts}, af)
                 rec = {"batch": b, "nonces": NONCES, "artifacts": n, "sec": round(dt, 3),
                        "nonce_per_s": round(rate, 2), "gpu_util": round(util, 1),
                        "model": MODEL, "url": URL}

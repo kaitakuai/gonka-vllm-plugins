@@ -299,6 +299,42 @@ def _select_poc_kv_scratch(
     return None
 
 
+_COMPILED_PREFILL_LOGGED = {"on": False, "off": None}
+
+
+def _compiled_prefill_native(worker, kv_scratch, inputs_embeds, n_tok, pp_group):
+    """The in-model PoC state when the compiled prefill experiment applies, else None.
+
+    Applies only with POC_PREFILL_COMPILED=1 and on the fresh-buffer embeds path
+    (no KV scratch), a single PP stage, a model without token-id routing, and a
+    batch that fits the state buffers. Anything else silently keeps the eager
+    scheme (logged once)."""
+    import os
+    if os.environ.get("POC_PREFILL_COMPILED", "") != "1":
+        return None
+    native = getattr(worker.model_runner, "_poc_native", None)
+    why = None
+    if native is None:
+        why = "no in-model PoC state on this runner"
+    elif kv_scratch is not None:
+        why = "KV-scratch embeds path selected (bf16 KV): the eager scheme is the fleet's"
+    elif inputs_embeds is None or pp_group.world_size > 1:
+        why = "pipeline parallel"
+    elif getattr(native, "token_id_vocab", 0):
+        why = "token-id routed model (hash-MoE)"
+    elif n_tok > native.max_tokens:
+        why = f"batch of {n_tok} tokens exceeds the state buffers ({native.max_tokens})"
+    if why is not None:
+        if _COMPILED_PREFILL_LOGGED["off"] != why:
+            logger.warning("poc prefill: compiled path requested but unavailable: %s", why)
+            _COMPILED_PREFILL_LOGGED["off"] = why
+        return None
+    if not _COMPILED_PREFILL_LOGGED["on"]:
+        logger.info("poc prefill: COMPILED path (POC_PREFILL_COMPILED=1) — experiment")
+        _COMPILED_PREFILL_LOGGED["on"] = True
+    return native
+
+
 @torch.inference_mode()
 def execute_poc_forward(
     worker,
@@ -446,19 +482,50 @@ def execute_poc_forward(
 
     if _diag:
         torch.cuda.synchronize(); _t_emb = _time.perf_counter()
-    with set_forward_context(
-        attn_metadata, vllm_config,
-        num_tokens=batch_size * seq_len,
-        slot_mapping=slot_mapping_dict,
-        skip_compiled=True,
-    ):
-        with poc_forward_context():
-            hidden_states = model(
-                input_ids=poc_input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-            )
+    native = _compiled_prefill_native(worker, kv_scratch, inputs_embeds,
+                                      batch_size * seq_len, pp_group)
+    if native is not None:
+        # EXPERIMENT (POC_PREFILL_COMPILED=1): run the prefill scheme through the
+        # model's compiled forward. Embeds + reflections ride the in-model PoC
+        # state (native.py, mask-gated, traced into the graph); the router mask
+        # stays off so expert selection is natural, as in the eager scheme. The
+        # layer hooks stay inactive (no poc_forward_context). KV-scratch configs
+        # never get here (the fleet's self-overwrite quirk cannot be reproduced
+        # inside a compiled graph).
+        n_tok = batch_size * seq_len
+        native.set_embeds(inputs_embeds.view(n_tok, hidden_size))
+        native.set_row_block_hashes([block_hash] * n_tok)
+        native.set_decode_chain()
+        native.set_mask(torch.ones(n_tok, dtype=torch.bool, device=device),
+                        route=False)
+        try:
+            with set_forward_context(
+                attn_metadata, vllm_config,
+                num_tokens=n_tok,
+                slot_mapping=slot_mapping_dict,
+            ):
+                hidden_states = model(
+                    input_ids=poc_input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=None,
+                )
+        finally:
+            native.set_mask(None)
+    else:
+        with set_forward_context(
+            attn_metadata, vllm_config,
+            num_tokens=batch_size * seq_len,
+            slot_mapping=slot_mapping_dict,
+            skip_compiled=True,
+        ):
+            with poc_forward_context():
+                hidden_states = model(
+                    input_ids=poc_input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+                )
 
     if _diag:
         torch.cuda.synchronize(); _t_fwd = _time.perf_counter()

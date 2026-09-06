@@ -390,6 +390,11 @@ class PoCNativeState:
         self.vectors_t, self.vectors = self.alloc_vectors(
             num_layers, max_tokens, hidden_size, device, dtype)
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
+        # Routing mask: which rows get the seeded router logits. Normally equal to
+        # ``mask`` (decode-PoC rows: embeds + reflections + seeded routing); the
+        # compiled prefill experiment sets it off so those rows keep natural
+        # routing while still getting embeds + reflections.
+        self.route_mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
         # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
         # per-block scheme (one draw shared by every nonce of the block); an int
@@ -627,12 +632,22 @@ class PoCNativeState:
         self.route_step[:b].copy_(pinned_to_device(row_steps, torch.int64, self.device))
         self._last_route_key = key
 
-    def set_mask(self, row_mask: torch.Tensor | None) -> None:
-        """Set which rows are PoC this forward (in place). None -> all chat."""
+    def set_mask(self, row_mask: torch.Tensor | None, route=None) -> None:
+        """Set which rows are PoC this forward (in place). None -> all chat.
+
+        ``route``: rows that get seeded routing. Default (None) = the same rows
+        as ``row_mask``; ``False`` = none (natural routing on every row; the
+        compiled prefill experiment); a bool tensor = an explicit subset."""
         self.mask.zero_()
-        if row_mask is not None:
-            n = row_mask.shape[0]
-            self.mask[:n].copy_(row_mask)
+        self.route_mask.zero_()
+        if row_mask is None:
+            return
+        n = row_mask.shape[0]
+        self.mask[:n].copy_(row_mask)
+        if route is None:
+            self.route_mask[:n].copy_(row_mask)
+        elif route is not False:
+            self.route_mask[:route.shape[0]].copy_(route)
 
 
 # Architectures whose MoE gate picks experts by token id (integer table on the
@@ -745,7 +760,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
         if _ablated("router"):
             continue
         _install_poc_patch(_gate, PoCRouterWrapper(
-            _gate, route_base, state.route_step, n_exp, top_k, state.mask))
+            _gate, route_base, state.route_step, n_exp, top_k, state.route_mask))
         # The gate-logit forcing above is the single routing seam, as in
         # 0.20. The selection override is NOT installed: replacing the
         # engine's expert weights with the ladder softmax collapses the
