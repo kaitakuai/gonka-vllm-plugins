@@ -104,25 +104,31 @@ def cap_prefill_chunk(step: int, engine_client, seq_len: int, prefill: bool) -> 
     return step
 
 
+POC_PREFILL_ROUND_DEFAULT = 32   # the 3.0.16 round when the chain sends no batch_size
+
+
 def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
                          prefill: bool = True) -> int:
     """How many nonces continuous mining pulls per iteration.
 
-    `configured` > 0 is honored verbatim. 0 = AUTO: ask the ENGINE how many PoC sequences
-    it can hold — poc_max_batch_size from ``--additional-config`` (gonka_poc), then
-    max_num_seqs directly — so a bigger machine mines a bigger round instead of being
-    pinned to a client-side constant. The literal fallback is last-resort ONLY and warns,
-    because a silent constant here is exactly how PoC ended up throttled to 32 on every
-    box regardless of what it could serve. A prefill-scheme round is one forward, so it
-    is additionally capped by max_num_batched_tokens // seq_len (``prefill_chunk_cap``).
-    Pure apart from the getattrs (unit-testable)."""
+    `configured` > 0 (the chain's batch_size) is honored verbatim. 0 means:
+    prefill scheme — the 3.0.16 default of 32, never engine-sized (the round is ONE
+    forward and its metadata buffers are sized by max_num_batched_tokens, so
+    max_num_seqs-sized rounds cannot run); decode scheme — AUTO, ask the engine
+    (poc_max_batch_size from ``--additional-config``, then max_num_seqs), since decode
+    rows are ordinary scheduler requests and the rolling window caps them anyway.
+    A prefill-scheme round is additionally capped by max_num_batched_tokens // seq_len
+    (``prefill_chunk_cap``): the chain's value is network-wide, the node's budget is
+    not. Pure apart from the getattrs (unit-testable)."""
     if configured:
         return cap_prefill_chunk(configured, engine_client, seq_len, prefill)
+    if prefill:
+        return cap_prefill_chunk(POC_PREFILL_ROUND_DEFAULT, engine_client, seq_len, True)
     vc = getattr(engine_client, "vllm_config", None)
     sc = getattr(vc, "scheduler_config", None)
     resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
     if resolved:
-        return cap_prefill_chunk(resolved, engine_client, seq_len, prefill)
+        return resolved
     logger.warning("PoC mining: engine config unreadable, defaulting round to 32")
     return 32
 
