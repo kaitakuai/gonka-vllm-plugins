@@ -497,9 +497,6 @@ class GenerateQueue:
         # nonces. Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
         # nonces to the chunk size no matter what the engine can serve.
         step = job.batch_size or total_nonces
-        if not job.poc_decode:
-            from gonka_poc.poc.routes import cap_prefill_chunk
-            step = cap_prefill_chunk(step, job.engine_client, job.seq_len, prefill=True)
         n_chunks = (total_nonces + step - 1) // step
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")
 

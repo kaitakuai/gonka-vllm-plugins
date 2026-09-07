@@ -78,32 +78,6 @@ POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
-def prefill_chunk_cap(engine_client, seq_len: int) -> int:
-    """Most nonces one prefill-scheme forward can take: the attention metadata
-    buffers are sized by ``max_num_batched_tokens``, and a chunk of
-    ``batch_size * seq_len`` tokens beyond it fails the forward. 0 = unknown
-    (engine config unreadable). Pure apart from the getattrs (unit-testable)."""
-    vc = getattr(engine_client, "vllm_config", None)
-    sc = getattr(vc, "scheduler_config", None)
-    mnbt = int(getattr(sc, "max_num_batched_tokens", 0) or 0)
-    if mnbt <= 0 or seq_len <= 0:
-        return 0
-    return max(1, mnbt // int(seq_len))
-
-
-def cap_prefill_chunk(step: int, engine_client, seq_len: int, prefill: bool) -> int:
-    """Clamp a client-side chunk size to what a prefill forward can take.
-    Decode rows ride the scheduler one request each and need no cap."""
-    if not prefill:
-        return step
-    cap = prefill_chunk_cap(engine_client, seq_len)
-    if cap and step > cap:
-        logger.info("PoC prefill chunk %d nonces x seq_len %d exceeds "
-                    "max_num_batched_tokens; using %d per forward", step, seq_len, cap)
-        return cap
-    return step
-
-
 POC_PREFILL_ROUND_DEFAULT = 32   # the 3.0.16 round when the chain sends no batch_size
 
 
@@ -117,13 +91,12 @@ def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
     max_num_seqs-sized rounds cannot run); decode scheme — AUTO, ask the engine
     (poc_max_batch_size from ``--additional-config``, then max_num_seqs), since decode
     rows are ordinary scheduler requests and the rolling window caps them anyway.
-    A prefill-scheme round is additionally capped by max_num_batched_tokens // seq_len
-    (``prefill_chunk_cap``): the chain's value is network-wide, the node's budget is
-    not. Pure apart from the getattrs (unit-testable)."""
+    batch_size x seq_len must fit the node's max_num_batched_tokens: that is the
+    chain's choice, the node does not resize it. Pure apart from the getattrs."""
     if configured:
-        return cap_prefill_chunk(configured, engine_client, seq_len, prefill)
+        return configured
     if prefill:
-        return cap_prefill_chunk(POC_PREFILL_ROUND_DEFAULT, engine_client, seq_len, True)
+        return POC_PREFILL_ROUND_DEFAULT
     vc = getattr(engine_client, "vllm_config", None)
     sc = getattr(vc, "scheduler_config", None)
     resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
@@ -681,8 +654,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     total_nonces = len(body.nonces)
     step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
-    step = cap_prefill_chunk(step, engine_client, body.params.seq_len,
-                             prefill=body.params.scheme != "decode")
     n_chunks = (total_nonces + step - 1) // step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
 
