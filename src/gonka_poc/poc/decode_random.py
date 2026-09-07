@@ -152,22 +152,24 @@ def random_pick_indices_gpu(
     return chosen.to(torch.int64)
 
 
-# Ladder offset, a per-model consensus parameter. The router adds
-# ``e_score_correction_bias`` after scoring, so on DeepSeek-V4 (sqrtsoftplus
-# scoring) the ladder floor ``scoring_func(base + 1)`` must exceed any bias
-# spread, otherwise an unforced expert can outvote a forced one; sqrtsoftplus(101)
-# ~= 10 is an order of magnitude above every bias measured (see ADR). Any other
-# model keeps base 0: a non-zero base changes which experts win under bias, and
-# the MiniMax golden cells were frozen with base 0 (03.09: base 100 doubled the
-# tau=0 mismatch rate on every MiniMax reference corpus).
-_LADDER_BASE_BY_MODEL = {"deepseek_v4": 100}
-_ladder_base = 0
+# Ladder base for seeded routing: a consensus constant of the decode scheme.
+# One value for every model since 2026-09-07: 100. The base lifts the forced
+# ladder above any router bias term (DeepSeek-V4 sqrtsoftplus + bias) so the
+# seeded experts win regardless of architecture; on MiniMax-M2.7 a fresh
+# B300<->H200 campaign showed the thresholds do not depend on the base (honest
+# cross 7.5-7.6 % at either base, fraud 12.2-12.4 %, gap 4.8 pp), so the
+# per-model map was dropped. Reference corpora frozen at base 0 (campaign R,
+# August) no longer apply to MiniMax; the base-100 goldens replace them.
+# Pending sign-off by the scheme owner (Ilya) before release.
+LADDER_BASE = 100
+_ladder_base = LADDER_BASE
 
 
 def set_ladder_base_for_model(model_type) -> int:
-    """Select the ladder base for ``model_type`` (called once at attach)."""
+    """Return the ladder base (one for all models; ``model_type`` is logged by
+    the caller and kept in the signature for the attach-time log line)."""
     global _ladder_base
-    _ladder_base = _LADDER_BASE_BY_MODEL.get(model_type, 0)
+    _ladder_base = LADDER_BASE
     return _ladder_base
 
 

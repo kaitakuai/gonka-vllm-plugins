@@ -3,6 +3,18 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
+
+The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)
+because the MiniMax reference cells had been frozen at 0 and a September 3 run at 100 looked
+twice as noisy — later traced to a poisoned compile cache, not to the base. A fresh
+B300 ↔ H200 campaign on MiniMax-M2.7 with corpora generated at both bases (honest on both
+boxes, QuantTrio AWQ fraud on the B300) shows the thresholds do not depend on the base:
+honest cross cells 7.5–7.6 % at either base, fraud 12.2–12.4 %, gap 4.76 → 4.79 pp,
+|z| ≤ 1.5 on every cross cell. `LADDER_BASE = 100` is now one constant for all models. The
+August MiniMax corpora (base 0) no longer apply; base-100 goldens replace them. This is a
+consensus constant of the decode scheme: sign-off by its owner is pending before release.
+
 ## 2026-09-05 — PoC knobs move from CacheConfig to `--additional-config`; `poc_req_ids` dropped
 
 Seam surface, tier 1. `SchedulerOutput.poc_req_ids` was redundant: the runner bridge
