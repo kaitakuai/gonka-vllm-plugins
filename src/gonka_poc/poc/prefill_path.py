@@ -15,6 +15,8 @@ endpoint, which is why this is a launch flag.
 import logging
 from typing import Any, Dict, List, Optional
 
+from gonka_poc._compat import current as _compat_current
+
 logger = logging.getLogger(__name__)
 
 POC_RPC_TIMEOUT_MS = 60000
@@ -90,7 +92,12 @@ async def execute_poc_forward_rpc(
     # populates artifacts; in TP-only it's typically the driver rank
     # (whichever ran the forward to completion). De-duplicate by nonce so a
     # buggy worker that doubles up doesn't corrupt the API response.
+    # Only the nonces of THIS call may come back: a reply for another nonce set
+    # means a rank answered a different call (a stale response after a failed
+    # RPC), and passing it on would ship someone else's artifacts as ours.
+    wanted = set(nonces)
     seen: set = set()
+    foreign: set = set()
     artifacts: List[Dict[str, Any]] = []
     for rank_result in results:
         if not rank_result:
@@ -99,8 +106,16 @@ async def execute_poc_forward_rpc(
             nonce = art.get("nonce")
             if nonce is None or nonce in seen:
                 continue
+            if nonce not in wanted:
+                foreign.add(nonce)
+                continue
             seen.add(nonce)
             artifacts.append(art)
+    if foreign:
+        raise RuntimeError(
+            f"PoC forward returned artifacts for {len(foreign)} nonce(s) that were "
+            f"not requested (e.g. {sorted(foreign)[:4]}): worker replies are out of "
+            "sync with calls; restart the engine")
 
     return {"artifacts": artifacts}
 
