@@ -88,6 +88,13 @@ nonces 27.3 nonce/s (window 512), PoC 1500 next to chat 97 s / 13.2 req/s (windo
 0.006 pp; decode-state pool 1024 (DeepSeek) and 704 (MiniMax) resolved from `max_num_seqs`
 through `additional_config` defaults.
 
+Hopper (2×H200, TP=2, DeepSeek V4 FP8, async scheduling on, 07.09): the ADR-0016
+livelock does not reproduce — PoC 3000 nonces at window 181 (sized by KV: 771k tokens)
+12.0 nonce/s, 0 preemptions; 1000 nonces submitted at once without a window 1000/1000,
+0 preemptions; the B300 goldens validate on the H200 within noise (NVFP4 0.0055 %, REAP
+3.39 % at τ=0.05); MiniMax TP=2: fraud cells 11–13 %, honest 4.6–8.6 %, same-hardware
+honest cells lower than on a foreign validator. TP=4 remains unmeasured.
+
 What remains engine-side after tier 1: `poc_params` on the request path
 (`EngineCoreRequest` → `Request` → `NewRequestData` → `CachedRequestState`), the
 `PoCOutput` / `poc_output` path back to the node with the emit-once finish, the sampler
