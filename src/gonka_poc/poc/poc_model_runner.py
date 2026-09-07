@@ -361,23 +361,6 @@ def execute_poc_forward(
 
     _ensure_layer_hooks(worker, block_hash, hidden_size)
 
-    if borrowed_block_ids is None:
-        # The in-place layout writes KV for row i into blocks i*B..(i+1)*B-1 of
-        # every group; past the pool that is an out-of-bounds GPU write (illegal
-        # memory access on sm_86/sm_90, silent corruption elsewhere) that takes
-        # the whole engine down. Refuse it before the forward.
-        cc = getattr(worker, "cache_config", None)
-        n_blocks = int(getattr(cc, "num_gpu_blocks", 0) or 0)
-        m_block = int(getattr(cc, "block_size", 0) or 0)
-        if n_blocks and m_block:
-            need = batch_size * math.ceil(seq_len / m_block)
-            if need > n_blocks:
-                raise RuntimeError(
-                    f"PoC prefill: {batch_size} nonces x seq_len {seq_len} need {need} "
-                    f"KV blocks, the pool has {n_blocks} ({n_blocks * m_block} tokens); "
-                    "the in-place layout would write past the pool. Lower batch_size "
-                    "or give the engine more KV memory.")
-
     # Per-token positions: shared by the model forward and (for architectures
     # that need it, e.g. DeepSeek-V4 C128A) the attention metadata.
     positions = torch.arange(
