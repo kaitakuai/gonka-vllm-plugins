@@ -488,19 +488,20 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     stats = {"start_time": 0, "total_processed": 0}
     stop_event = asyncio.Event()
     
-    # The prefill scheme runs its forward OUTSIDE the scheduler, in place over
-    # KV blocks 0..N: live inference must be gated off and drained first, as in
-    # 0.1.3 (ADR-0013 ordering: activate -> abort -> spawn). Decode rows share
-    # the scheduler with chat by design and take no gate.
-    gate = None
-    if body.params.scheme != "decode":
-        gate = getattr(request.app.state, "gonka_gate", None)
-        if gate is None:
-            raise HTTPException(
-                status_code=503,
-                detail="PoCGate not installed on app.state.gonka_gate; prefill-scheme "
-                       "mining cannot run next to live inference")
-        gate.activate("init-generate")
+    # A mining round owns the node, whichever scheme: live inference is gated
+    # off (503) and drained first, as in 0.1.3 (ADR-0013 ordering: activate ->
+    # abort -> spawn), and /stop or the round's end re-opens it. The prefill
+    # scheme needs this for correctness (its forward writes KV blocks 0..N in
+    # place); the decode scheme could share the scheduler with chat, but a
+    # round next to live chat starves both sides, and the chain's UX is
+    # "PoC runs, inference pauses, artifacts get published".
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is None:
+        raise HTTPException(
+            status_code=503,
+            detail="PoCGate not installed on app.state.gonka_gate; a mining round "
+                   "cannot run next to live inference")
+    gate.activate("init-generate")
 
     callback_sender = None
     callback_task = None
