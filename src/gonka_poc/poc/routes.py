@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 import logging
 from gonka_poc.mixed.policy import poc_cfg
@@ -105,8 +105,19 @@ class PoCParamsModel(BaseModel):
     # is the chained sphere_k trajectory. Absent => prefill, so a chain that
     # knows nothing about decode keeps working unchanged.
     scheme: Literal["prefill", "decode"] = "prefill"
-    # Decode steps. Only read when scheme == "decode".
+    # The same switch as a flag, mirroring PoCParams.poc_decode: the chain
+    # sends {"decode": true, "max_tokens": N}. Either form selects decode.
+    decode: bool = False
+    # Decode steps. Only read for the decode scheme.
     max_tokens: int = 0
+
+    @model_validator(mode="after")
+    def _decode_flag(self):
+        if self.decode:
+            self.scheme = "decode"
+        elif self.scheme == "decode":
+            self.decode = True
+        return self
 
 
 class PoCInitGenerateRequest(BaseModel):
