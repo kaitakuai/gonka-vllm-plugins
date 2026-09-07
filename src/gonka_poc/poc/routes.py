@@ -63,10 +63,6 @@ def _server_gpu() -> str:
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
-# Consecutive failures of one mining chunk before the round is stopped instead
-# of retried forever (a busy engine clears in a few retries; a broken PoC path
-# never does).
-POC_MAX_CONSECUTIVE_ERRORS = int(os.environ.get("POC_MAX_CONSECUTIVE_ERRORS", "20"))
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
 # Request default when the chain sends no batch_size: 32, as in 3.0.16.
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
@@ -394,16 +390,13 @@ async def _generation_loop(
                     max_tokens=mt,
                     block_height=config["block_height"],
                 )
-            except Exception as e:
+            except (TimeoutError, asyncio.TimeoutError):
+                # Engine busy: retry the same chunk, as in 3.0.16. Any other
+                # error ends the round (the task's done-callback logs it and
+                # releases the gate).
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning(f"PoC generation error (#{timeout_count}), engine busy: {e}")
-                if timeout_count >= POC_MAX_CONSECUTIVE_ERRORS:
-                    # The same chunk failing this many times in a row is not a
-                    # busy engine; retrying forever would hide a dead PoC path.
-                    logger.error("PoC generation: %d consecutive failures on the same "
-                                 "chunk, stopping the round: %s", timeout_count, e)
-                    raise
+                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
