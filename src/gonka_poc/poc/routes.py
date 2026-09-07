@@ -68,35 +68,23 @@ POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 # never does).
 POC_MAX_CONSECUTIVE_ERRORS = int(os.environ.get("POC_MAX_CONSECUTIVE_ERRORS", "20"))
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
-# 0 = NO client-side chunking: submit every nonce at once and let the ENGINE batch them
-# (it caps the per-step PoC batch at poc_max_batch_size, which auto-scales to max_num_seqs).
-# A nonzero value chunks the submission and awaits each chunk SEQUENTIALLY, so it pins
-# in-flight nonces to that number regardless of what the engine can serve -- the old
-# hardcoded 32 throttled PoC to 32 concurrent sequences on every machine while inference
-# scaled to hundreds. Override only to deliberately limit concurrency.
-POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
+# Request default when the chain sends no batch_size: 32, as in 3.0.16.
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
-
-POC_PREFILL_ROUND_DEFAULT = 32   # the 3.0.16 round when the chain sends no batch_size
-
 
 def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
                          prefill: bool = True) -> int:
     """How many nonces continuous mining pulls per iteration.
 
-    `configured` > 0 (the chain's batch_size) is honored verbatim. 0 means:
-    prefill scheme — the 3.0.16 default of 32, never engine-sized (the round is ONE
-    forward and its metadata buffers are sized by max_num_batched_tokens, so
-    max_num_seqs-sized rounds cannot run); decode scheme — AUTO, ask the engine
-    (poc_max_batch_size from ``--additional-config``, then max_num_seqs), since decode
-    rows are ordinary scheduler requests and the rolling window caps them anyway.
-    batch_size x seq_len must fit the node's max_num_batched_tokens: that is the
-    chain's choice, the node does not resize it. Pure apart from the getattrs."""
-    if configured:
+    The chain's batch_size, verbatim, as in 3.0.16 (the request default is
+    POC_BATCH_SIZE_DEFAULT = 32). The decode scheme alone treats 0 as AUTO —
+    poc_max_batch_size from ``--additional-config``, then max_num_seqs — since its
+    rows are ordinary scheduler requests under the rolling window. A prefill-scheme
+    round is one forward; whether batch_size x seq_len fits the node is the
+    operator's configuration, the node does not resize it."""
+    if configured or prefill:
         return configured
-    if prefill:
-        return POC_PREFILL_ROUND_DEFAULT
     vc = getattr(engine_client, "vllm_config", None)
     sc = getattr(vc, "scheduler_config", None)
     resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
