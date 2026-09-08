@@ -80,6 +80,9 @@ class PoCRunnerBridge:
             model, layers, inner, runner.max_num_tokens,
             runner.model_config.get_hidden_size(), runner.device, runner.dtype,
             hf_config=getattr(runner.model_config, "hf_config", None),
+            # distinct (block_hash, nonce) draws in one batch <= rows in flight
+            max_groups=int(getattr(getattr(runner, "scheduler_config", None),
+                                   "max_num_seqs", 0) or 0) or None,
         )
         # mixed_decode reads the state off the runner (0.20 contract).
         runner._poc_native = self.native
