@@ -49,9 +49,10 @@ from typing import Iterator, List, Sequence, Set, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Blessed prefixes for private vllm.v1.* touchpoints: the engine-facing
-# mixed subpackage and tests. Matching is done on the path RELATIVE to
+# mixed subpackage, the version-dispatched _compat adapters (the channel the
+# workflow header names) and tests. Matching is done on the path RELATIVE to
 # REPO_ROOT (POSIX-normalised).
-ALLOWED_V1_PREFIXES = ("src/gonka_poc/mixed/", "tests/")
+ALLOWED_V1_PREFIXES = ("src/gonka_poc/mixed/", "src/gonka_poc/_compat/", "tests/")
 
 EXCLUDE_DIRS: Set[str] = {
     ".git",
