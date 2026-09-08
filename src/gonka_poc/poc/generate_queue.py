@@ -65,6 +65,10 @@ def _server_gpu() -> str:
 
 
 POC_ROLLING_WINDOW_DEFAULT = 256
+# vLLM schedules lower values first under --scheduling-policy priority (chat
+# requests carry 0): PoC rows go ahead of chat, and chat is what gets preempted
+# when KV runs short. Under the default FCFS policy the value is ignored.
+POC_REQUEST_PRIORITY = -1
 
 
 def _rolling_window(total_nonces: int) -> int:
@@ -205,7 +209,7 @@ async def compute_nonce_artifacts(
                 sampling_params=None,
                 poc_params=poc_params,
                 request_id=request_id,
-                priority=10,
+                priority=POC_REQUEST_PRIORITY,
             ):
                 if not output.finished:
                     continue
