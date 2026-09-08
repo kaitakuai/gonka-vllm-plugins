@@ -180,18 +180,17 @@ class PoCDecodeState:
 
 
 class PoCMixedDecodeManager:
-    """Per-request decode-state pool for step-driven mixed decode-PoC.
-
-    One instance per model runner (lazily created). A finite pool of
-    ``poc_max_batch_size`` state slots (sphere_k chaining + step counter); the
-    scheduler caps concurrent decode-PoC requests to that many, so ``allocate``
-    never starves in a correct configuration (returns ``None`` defensively if it
-    would). KV itself is paged/dynamic via the manager — slots hold no blocks.
+    """Per-request decode state for step-driven mixed decode-PoC (one instance
+    per model runner). Unbounded: a row keeps its state across preemptions, so
+    rows holding state can exceed the rows running (max_num_seqs), and a finite
+    slot pool sized by max_num_seqs ran dry under preemption (MiniMax-M2.7,
+    max_num_seqs 128, window 256: 53 of 1000 nonces came back without a
+    trajectory). KV itself is paged via the scheduler — the state holds no blocks.
     """
 
-    def __init__(self, poc_max_batch_size: int):
-        self._free_slots: list[int] = list(range(poc_max_batch_size))
+    def __init__(self, poc_max_batch_size: int = 0):
         self._state: dict[str, PoCDecodeState] = {}
+        self._next_slot = 0
 
     def get(self, req_id: str) -> PoCDecodeState | None:
         return self._state.get(req_id)
@@ -201,39 +200,22 @@ class PoCMixedDecodeManager:
         existing = self._state.get(req_id)
         if existing is not None:
             return existing
-        if not self._free_slots:
-            return None
-        slot = self._free_slots.pop(0)
         st = PoCDecodeState(
-            nonce=nonce, slot=slot, seq_len=seq_len, max_tokens=max_tokens
+            nonce=nonce, slot=self._next_slot, seq_len=seq_len, max_tokens=max_tokens
         )
+        self._next_slot += 1
         self._state[req_id] = st
         return st
 
     def free(self, req_id: str) -> None:
-        st = self._state.pop(req_id, None)
-        if st is not None:
-            self._free_slots.append(st.slot)
+        self._state.pop(req_id, None)
 
 
 def get_decode_manager(runner) -> "PoCMixedDecodeManager":
-    """Lazily get/create the per-runner mixed-decode manager.
-
-    Pool size resolves like the scheduler's admission cap: the config value is
-    0 (AUTO) until resolved, so sizing from the raw field would create an EMPTY
-    pool — every allocate fails, decode state never exists, and the prefill
-    step emits a pure-path artifact instead of starting the chain."""
+    """Lazily get/create the per-runner mixed-decode state store."""
     mgr = getattr(runner, "_poc_mixed_decode_mgr", None)
     if mgr is None:
-        sc = runner.vllm_config.scheduler_config
-        # State slots hold no KV. vLLM never runs more rows than max_num_seqs,
-        # so a pool of that size cannot run out (a row without a slot would drop
-        # its nonce); an explicit poc_max_batch_size is honoured verbatim.
-        configured = int(poc_cfg(runner.vllm_config, "poc_max_batch_size") or 0)
-        cap = configured or int(sc.max_num_seqs)
-        logger.info("poc: decode-PoC state pool: %d slots (configured=%d, max_num_seqs=%d)",
-                    cap, configured, sc.max_num_seqs)
-        mgr = PoCMixedDecodeManager(cap)
+        mgr = PoCMixedDecodeManager()
         runner._poc_mixed_decode_mgr = mgr
     return mgr
 
