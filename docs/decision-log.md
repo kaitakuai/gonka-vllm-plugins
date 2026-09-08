@@ -3,6 +3,48 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
+
+The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)
+because the MiniMax reference cells had been frozen at 0 and a September 3 run at 100 looked
+twice as noisy — later traced to a poisoned compile cache, not to the base. A fresh
+B300 ↔ H200 campaign on MiniMax-M2.7 with corpora generated at both bases (honest on both
+boxes, QuantTrio AWQ fraud on the B300) shows the thresholds do not depend on the base:
+honest cross cells 7.5–7.6 % at either base, fraud 12.2–12.4 %, gap 4.76 → 4.79 pp,
+|z| ≤ 1.5 on every cross cell. `LADDER_BASE = 100` is now one constant for all models. The
+August MiniMax corpora (base 0) no longer apply; base-100 goldens replace them. This is a
+consensus constant of the decode scheme: sign-off by its owner is pending before release.
+
+## 2026-09-05 — PoC knobs move from CacheConfig to `--additional-config`; `poc_req_ids` dropped
+
+Seam surface, tier 1. `SchedulerOutput.poc_req_ids` was redundant: the runner bridge
+already knows every PoC row from `NewRequestData.poc_params` and now intersects its own
+registry with the step's scheduled requests. The four PoC knobs on the fork's `CacheConfig`
+had no CLI and only ever held their defaults; they are read from vLLM's public
+`--additional-config '{"gonka_poc": {...}}'` instead, same defaults. `CacheConfig` and
+`SchedulerOutput` are back to stock (residual `vllm/` diff 35 → 34 files, −40 lines). No
+behaviour change; verified on 1×B300 against the post-removal numbers of ADR-0017. Tier 2
+(PoC as an ordinary request via `SamplingParams.extra_args`, artifacts over
+`collective_rpc`) is designed but not done. See
+[ADR-0017, addendum](adr/ADR-0017-poc-scheduled-like-chat.md).
+
+## 2026-09-05 — PoC rows are scheduled like chat; the in-engine admission layer is gone
+
+The six Hopper fixes of ADR-0016 were patches inside `PoCAdmission`, the per-step PoC
+policy ported from the 0.20 in-tree branch (row cap, token share, KV headroom gate, stall
+hand-off, decode-only isolation, first-decode hold). Vlad's point held: the layer created
+the problems it solved, because a round was dumped into the scheduler in one go and then
+metered by hand. Measured on 1×B300 with the layer bypassed and the hold removed: verdict
+unchanged (DeepSeek goldens at τ=0.05 and 42 MiniMax cells within noise), PoC alone
+31.7 vs 31.8 nonce/s, PoC next to chat 84 s / 15.5 req/s vs 86 s / 10.2 with the layer
+(client window 256), no preemptions, no prev_k race even at window 1.
+
+Removed: `PoCAdmission` and four of the five scheduler hooks (one `poc_step_tokens` call
+remains: atomic PoC prefill, one token per decode step), decode-only steps, the KV
+headroom gate, `poc_share`, the fused Triton reflection, the admission diagnostics, and the
+experiment knobs. `POC_ROLLING_WINDOW` (default 256) is the node's PoC scheduling knob.
+See [ADR-0017](adr/ADR-0017-poc-scheduled-like-chat.md).
+
 ## 2026-09-04 — Consensus constants in traced code change only through source
 
 A ladder-base experiment on 1×B300 (MiniMax-M2.7: boot with `POC_LADDER_BASE=100`, then

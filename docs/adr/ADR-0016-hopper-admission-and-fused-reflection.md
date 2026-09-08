@@ -1,6 +1,6 @@
 # ADR-0016 — Decode-PoC admission on hybrid KV / cudagraph-bound batches, and the fused reflection
 
-**Status:** Accepted (2026-09-02).
+**Status:** Superseded by [ADR-0017](ADR-0017-poc-scheduled-like-chat.md) (2026-09-05): the admission layer these decisions patched, and the fused reflection, were removed.
 **Branch:** `axeltec/rolling-poc-admission` (commits `5e1a753`, `3f83146`,
 `e4e0f65`, `153afac`, `2bbada6`, `eb8163c`).
 **Hardware:** 4×H100 SXM, TP=4, vLLM 0.28.0, DeepSeek-V4-Flash-0731 FP8,

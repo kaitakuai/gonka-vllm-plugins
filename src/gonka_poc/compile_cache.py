@@ -2,8 +2,8 @@
 
 vLLM keys its torch.compile cache (compiled graphs and the AOT artifacts) by its own
 environment variables, the engine config and the *source* of the traced files. A
-plugin knob that changes what the forward does at trace time (which reflection
-path runs, which PoC interventions are ablated) is none of those, so a host that
+plugin knob that changes what the forward does at trace time (which PoC
+interventions are ablated, debug prints) is none of those, so a host that
 already holds a compiled graph loads it regardless of the knob: the process logs
 one behaviour and runs another (03-04.09.2026, MiniMax on 1xB300: the ladder base
 override rode a cached graph for a whole evening).
@@ -27,7 +27,6 @@ _MARK = "gonka-poc-knobs-"
 # knob -> default value (after normalisation). Extend when a new knob changes
 # the traced forward; consensus parameters are NOT knobs (source constants).
 _TRACED_KNOBS: dict[str, str] = {
-    "POC_FUSED_REFLECT": "1",   # Triton one-pass reflection vs the reference path
     "POC_ABLATE": "",           # diagnostic ablation of PoC interventions
     "VLLM_POC_DEBUG_TP": "",    # debug prints inside the forward
 }
@@ -35,8 +34,6 @@ _TRACED_KNOBS: dict[str, str] = {
 
 def _normalise(name: str, raw: str | None) -> str:
     v = (raw or "").strip().lower()
-    if name == "POC_FUSED_REFLECT":
-        return "0" if v in ("0", "false", "no", "off") else "1"
     if name == "POC_ABLATE":
         return ",".join(sorted(x.strip() for x in v.split(",") if x.strip()))
     if name == "VLLM_POC_DEBUG_TP":

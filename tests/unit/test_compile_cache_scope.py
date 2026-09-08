@@ -6,17 +6,17 @@ def test_defaults_leave_the_root_alone():
     env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r"}
     assert scope_compile_cache(env) is None
     assert env["VLLM_CACHE_ROOT"] == "/tmp/vllm_r"
-    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "POC_FUSED_REFLECT": "1", "POC_ABLATE": ""}
+    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "POC_ABLATE": "", "VLLM_POC_DEBUG_TP": "0"}
     assert scope_compile_cache(env) is None          # explicit defaults == unset
 
 
 def test_non_default_knob_gets_its_own_root_and_is_idempotent():
-    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "POC_FUSED_REFLECT": "0"}
+    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "VLLM_POC_DEBUG_TP": "1"}
     scoped = scope_compile_cache(env)
     assert scoped and scoped.startswith("/tmp/vllm_r/gonka-poc-knobs-")
     assert env["VLLM_CACHE_ROOT"] == scoped
     assert scope_compile_cache(env) == scoped        # child process inherits: unchanged
-    env2 = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "POC_FUSED_REFLECT": "0", "POC_ABLATE": "router,reflect"}
+    env2 = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "VLLM_POC_DEBUG_TP": "1", "POC_ABLATE": "router,reflect"}
     other = scope_compile_cache(env2)
     assert other != scoped
     env3 = {"VLLM_CACHE_ROOT": "/tmp/vllm_r", "POC_ABLATE": "reflect, router"}
@@ -24,6 +24,6 @@ def test_non_default_knob_gets_its_own_root_and_is_idempotent():
 
 
 def test_parent_scoped_for_other_knobs_is_replaced():
-    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r/gonka-poc-knobs-deadbeef00", "POC_FUSED_REFLECT": "0"}
+    env = {"VLLM_CACHE_ROOT": "/tmp/vllm_r/gonka-poc-knobs-deadbeef00", "VLLM_POC_DEBUG_TP": "1"}
     scoped = scope_compile_cache(env)
     assert scoped.startswith("/tmp/vllm_r/gonka-poc-knobs-") and "deadbeef00" not in scoped

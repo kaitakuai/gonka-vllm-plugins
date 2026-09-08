@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 import logging
+from gonka_poc.mixed.policy import poc_cfg
 from gonka_poc.poc.config import PoCState
 from gonka_poc.poc.data import (
     Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
@@ -23,6 +24,7 @@ from gonka_poc.poc.generate_queue import (
 )
 from gonka_poc.poc.reservation import poc_reservation
 from gonka_poc.poc.validation import run_validation
+from gonka_poc._compat import current as _compat_current
 
 logger = logging.getLogger(__name__)
 
@@ -62,31 +64,26 @@ POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
-# 0 = NO client-side chunking: submit every nonce at once and let the ENGINE batch them
-# (it caps the per-step PoC batch at poc_max_batch_size, which auto-scales to max_num_seqs).
-# A nonzero value chunks the submission and awaits each chunk SEQUENTIALLY, so it pins
-# in-flight nonces to that number regardless of what the engine can serve -- the old
-# hardcoded 32 throttled PoC to 32 concurrent sequences on every machine while inference
-# scaled to hundreds. Override only to deliberately limit concurrency.
-POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "0"))
+# Request default when the chain sends no batch_size: 32, as in 3.0.16.
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
-def resolve_mining_round(configured: int, engine_client) -> int:
+def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
+                         prefill: bool = True) -> int:
     """How many nonces continuous mining pulls per iteration.
 
-    `configured` > 0 is honored verbatim. 0 = AUTO: ask the ENGINE how many PoC sequences
-    it can hold — poc_max_batch_size (itself resolved to max_num_seqs at startup), then
-    max_num_seqs directly — so a bigger machine mines a bigger round instead of being
-    pinned to a client-side constant. The literal fallback is last-resort ONLY and warns,
-    because a silent constant here is exactly how PoC ended up throttled to 32 on every
-    box regardless of what it could serve. Pure apart from the getattrs (unit-testable)."""
-    if configured:
+    The chain's batch_size, verbatim, as in 3.0.16 (the request default is
+    POC_BATCH_SIZE_DEFAULT = 32). The decode scheme alone treats 0 as AUTO —
+    poc_max_batch_size from ``--additional-config``, then max_num_seqs — since its
+    rows are ordinary scheduler requests under the rolling window. A prefill-scheme
+    round is one forward; whether batch_size x seq_len fits the node is the
+    operator's configuration, the node does not resize it."""
+    if configured or prefill:
         return configured
     vc = getattr(engine_client, "vllm_config", None)
-    cc = getattr(vc, "cache_config", None)
     sc = getattr(vc, "scheduler_config", None)
-    resolved = getattr(cc, "poc_max_batch_size", 0) or getattr(sc, "max_num_seqs", 0)
+    resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
     if resolved:
         return resolved
     logger.warning("PoC mining: engine config unreadable, defaulting round to 32")
@@ -108,8 +105,19 @@ class PoCParamsModel(BaseModel):
     # is the chained sphere_k trajectory. Absent => prefill, so a chain that
     # knows nothing about decode keeps working unchanged.
     scheme: Literal["prefill", "decode"] = "prefill"
-    # Decode steps. Only read when scheme == "decode".
+    # The same switch as a flag, mirroring PoCParams.poc_decode: the chain
+    # sends {"decode": true, "max_tokens": N}. Either form selects decode.
+    decode: bool = False
+    # Decode steps. Only read for the decode scheme.
     max_tokens: int = 0
+
+    @model_validator(mode="after")
+    def _decode_flag(self):
+        if self.decode:
+            self.scheme = "decode"
+        elif self.scheme == "decode":
+            self.decode = True
+        return self
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -362,7 +370,9 @@ async def _generation_loop(
     # Continuous mining pulls a round of nonces per iteration. 0 = AUTO -> ask the ENGINE
     # how many PoC sequences it can hold (poc_max_batch_size, auto-scaled to max_num_seqs)
     # instead of a client-side constant, so a bigger machine mines a bigger round.
-    batch_size = resolve_mining_round(config["batch_size"], engine_client)
+    poc_decode = config.get("scheme", "prefill") == "decode"
+    batch_size = resolve_mining_round(config["batch_size"], engine_client,
+                                      config["seq_len"], prefill=not poc_decode)
 
     start_time = time.time()
     stats["start_time"] = start_time
@@ -391,10 +401,13 @@ async def _generation_loop(
                     max_tokens=mt,
                     block_height=config["block_height"],
                 )
-            except Exception as e:
+            except (TimeoutError, asyncio.TimeoutError):
+                # Engine busy: retry the same chunk, as in 3.0.16. Any other
+                # error ends the round (the task's done-callback logs it and
+                # releases the gate).
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    logger.warning(f"PoC generation error (#{timeout_count}), engine busy: {e}")
+                    logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
@@ -467,26 +480,59 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     stats = {"start_time": 0, "total_processed": 0}
     stop_event = asyncio.Event()
     
+    # A mining round owns the node, whichever scheme: live inference is gated
+    # off (503) and drained first, as in 0.1.3 (ADR-0013 ordering: activate ->
+    # abort -> spawn), and /stop or the round's end re-opens it. The prefill
+    # scheme needs this for correctness (its forward writes KV blocks 0..N in
+    # place); the decode scheme could share the scheduler with chat, but a
+    # round next to live chat starves both sides, and the chain's UX is
+    # "PoC runs, inference pauses, artifacts get published".
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is None:
+        raise HTTPException(
+            status_code=503,
+            detail="PoCGate not installed on app.state.gonka_gate; a mining round "
+                   "cannot run next to live inference")
+    gate.activate("init-generate")
+
     callback_sender = None
     callback_task = None
-    if body.url:
-        callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
-        callback_task = asyncio.create_task(callback_sender.run())
+    try:
+        if body.url:
+            callback_sender = CallbackSender(body.url, stop_event, body.params.k_dim)
+            callback_task = asyncio.create_task(callback_sender.run())
 
-    gen_task = asyncio.create_task(
-        _generation_loop(engine_client, stop_event, callback_sender, config, stats)
-    )
-    
-    def _on_generation_done(task: asyncio.Task):
-        if task.cancelled():
-            logger.info("PoC generation task cancelled, flag cleared")
-        elif task.exception():
-            logger.warning("PoC generation task failed, flag cleared: %s",
-                           task.exception())
-        else:
-            logger.info("PoC generation task completed, flag cleared")
-    
-    gen_task.add_done_callback(_on_generation_done)
+        if gate is not None:
+            aborted = await _compat_current().abort_all_requests(engine_client)
+            logger.info("PoC init: aborted %d in-flight requests before generation",
+                        aborted)
+
+        gen_task = asyncio.create_task(
+            _generation_loop(engine_client, stop_event, callback_sender, config, stats)
+        )
+
+        def _on_generation_done(task: asyncio.Task):
+            if gate is not None:
+                gate.deactivate()
+            if task.cancelled():
+                logger.info("PoC generation task cancelled, gate released")
+            elif task.exception():
+                logger.warning("PoC generation task failed, gate released: %s",
+                               task.exception())
+            else:
+                logger.info("PoC generation task completed, gate released")
+
+        gen_task.add_done_callback(_on_generation_done)
+    except Exception:
+        # Nothing between activate() and add_done_callback() may leave the
+        # gate latched ON across operator retries.
+        if callback_task is not None:
+            stop_event.set()
+            callback_task.cancel()
+        if gate is not None:
+            gate.deactivate()
+        logger.exception("PoC init: failed before the generation task was spawned")
+        raise
     
     _poc_tasks[app_id] = {
         "gen_task": gen_task,
@@ -753,6 +799,11 @@ async def stop_round(request: Request) -> dict:
     app_id = id(request.app)
 
     await _cancel_poc_tasks(app_id)
+    # The generation task's done-callback releases the gate; clear it here too
+    # so a stop always re-opens inference (deactivate is idempotent).
+    gate = getattr(request.app.state, "gonka_gate", None)
+    if gate is not None:
+        gate.deactivate()
     await clear_queue()
     # Cancelling the task does not evict requests already inside the engine:
     # a round started while they drain shares a forward with them and every

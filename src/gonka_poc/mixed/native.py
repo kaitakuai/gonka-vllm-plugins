@@ -16,10 +16,11 @@ import os
 
 import torch
 
-from gonka_poc.mixed import reflect_kernel as _reflect_kernel
 from torch import nn
 
 import logging
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +83,11 @@ def _reflect_torch(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torc
 
 
 def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Reflection on PoC rows: fused Triton kernel (one pass per row) where
-    available, else the four-kernel reference. v: [n, *pad, hidden],
-    mask: [n, *pad, 1] — as fed by PoCLayerWrapper._apply."""
-    if x.is_cuda and _reflect_kernel.fused_enabled():
-        n = x.shape[0]
-        return _reflect_kernel.reflect_fused(
-            x, v.reshape(n, -1), mask.reshape(n))
+    """Reflection on PoC rows — the reference path, and the only path: the
+    reflection is consensus math, and an explicit torch expression behaves the
+    same on every node (a fused Triton variant was removed on 2026-09-05: it
+    sped PoC up ~12% on Hopper, did nothing for inference and rounded
+    differently per architecture). v: [n, *pad, hidden], mask: [n, *pad, 1]."""
     return _reflect_torch(x, v, mask)
 
 
@@ -125,10 +124,16 @@ class PoCLayerWrapper(nn.Module):
     ``v`` is this layer's reflection vector; ``mask`` is the shared per-row PoC mask
     (both stable buffers, updated in place)."""
 
-    def __init__(self, inner: nn.Module, v: torch.Tensor, mask: torch.Tensor):
+    def __init__(self, inner: nn.Module, table: torch.Tensor,
+                 row_group: torch.Tensor, mask: torch.Tensor):
         super().__init__()
         self.inner = inner
-        self.register_buffer("poc_v", v, persistent=False)
+        # table: this layer's [groups, hidden] reflection vectors (group 0 is the
+        # zero vector); row_group: shared [max_tokens] int64 group id per row.
+        # A row's vector is gathered from the table, so the state holds one copy
+        # per (block_hash[, nonce]) instead of one per token per layer.
+        self.register_buffer("poc_table", table, persistent=False)
+        self.register_buffer("poc_row_group", row_group, persistent=False)
         self.register_buffer("poc_mask", mask, persistent=False)
         self._inner_call = inner.forward
 
@@ -139,7 +144,8 @@ class PoCLayerWrapper(nn.Module):
         # dimensions sit there; the reflection always runs along the hidden dim.
         n = x.shape[0]
         pad = (1,) * (x.dim() - 2)
-        return _reflect(x, self.poc_v[:n].view(n, *pad, -1).to(x.dtype),
+        v = self.poc_table.index_select(0, self.poc_row_group[:n])
+        return _reflect(x, v.view(n, *pad, -1).to(x.dtype),
                         self.poc_mask[:n].view(n, *pad, 1))
 
     def forward(self, *args, **kwargs):
@@ -380,18 +386,21 @@ class PoCNativeState:
     """
 
     def __init__(self, num_layers: int, hidden_size: int, max_tokens: int,
-                 device, dtype):
+                 device, dtype, max_groups: int | None = None):
         self.device = device
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.max_tokens = max_tokens
-        # ONE [layers, rows, hidden] buffer; self.vectors keeps the per-layer
-        # entries as VIEWS into it, so the layer wrappers are unchanged. Zeroing
-        # is then one kernel instead of num_layers, and a group's reflection
-        # vector lands in every layer with one indexed write instead of one per
-        # layer (62 on MiniMax-M2, per prefill chunk).
-        self.vectors_t, self.vectors = self.alloc_vectors(
-            num_layers, max_tokens, hidden_size, device, dtype)
+        # ONE [layers, groups, hidden] table; self.table keeps the per-layer
+        # entries as VIEWS into it. A group is one (block_hash[, nonce]) draw,
+        # group 0 is the zero vector; rows point at their group through the
+        # shared row_group index and the layer wrapper gathers. Per-row storage
+        # ([layers, max_tokens, hidden]) cost 12.5 GB on MiniMax-M2.7 at
+        # max_num_batched_tokens 32768; the table is a few tens of MB.
+        self.max_groups = int(max_groups or max_tokens)
+        self.table_t, self.table = self.alloc_table(
+            num_layers, self.max_groups + 1, hidden_size, device, dtype)
+        self.row_group = torch.zeros(max_tokens, dtype=torch.int64, device=device)
         self.mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
         self.embeds = torch.zeros(max_tokens, hidden_size, device=device, dtype=dtype)
         # (block_hash, nonce-or-None) -> per-layer vectors. nonce=None is the
@@ -476,9 +485,9 @@ class PoCNativeState:
     _HASH_CACHE_MAX = 256
 
     @staticmethod
-    def alloc_vectors(num_layers, max_tokens, hidden_size, device, dtype):
-        """Contiguous reflection buffer + per-layer views onto it."""
-        buf = torch.zeros(num_layers, max_tokens, hidden_size,
+    def alloc_table(num_layers, n_groups, hidden_size, device, dtype):
+        """Contiguous reflection table + per-layer views onto it."""
+        buf = torch.zeros(num_layers, n_groups, hidden_size,
                           device=device, dtype=dtype)
         return buf, list(buf)
 
@@ -506,7 +515,7 @@ class PoCNativeState:
             suffix = ("" if nonce is None else f"_nonce{nonce}")
             # Cache in the buffer dtype: halves the footprint vs the generator's
             # fp32 and matches what the scatter writes (copy_ casts identically).
-            dt = self.vectors[0].dtype
+            dt = self.table[0].dtype
             vs = [
                 generate_householder_vector(
                     f"{block_hash}{suffix}_layer_{i}_householder",
@@ -536,21 +545,28 @@ class PoCNativeState:
         refl_key = (tuple(row_hashes), tuple(row_refl_nonces))
         if refl_key == self._last_refl_key:
             return
-        self.vectors_t.zero_()
-        # Rows sharing (block_hash, refl_nonce) get the SAME layer vector, so
-        # scatter per group, not per row: the per-row form issued num_layers x B
-        # one-row copies and starved the prefill forward (23% GPU busy).
+        # Rows sharing (block_hash, refl_nonce) share one table slot; the
+        # per-row index is written once for the whole batch. Rows with no
+        # block_hash point at slot 0 (the zero vector; masked out anyway).
         groups: dict = {}
         for row, (bh, nz) in enumerate(zip(row_hashes, row_refl_nonces)):
             if bh is None:
                 continue
             groups.setdefault((bh, nz), []).append(row)
-        for (bh, nz), rows in groups.items():
-            rows_t = pinned_to_device(rows, torch.int64, self.device)
-            # one write covers every layer: [L, n_rows, hidden] <- [L, 1, hidden]
-            self.vectors_t[:, rows_t, :] = self._stacked_vectors_for(bh, nz).unsqueeze(1)
+        if len(groups) > self.max_groups:
+            raise RuntimeError(
+                f"PoC reflection table: {len(groups)} distinct (block_hash, nonce) "
+                f"groups in one batch, table holds {self.max_groups} (max_num_seqs)")
+        idx = np.zeros(len(row_hashes), dtype=np.int64)
+        for gid, ((bh, nz), rows) in enumerate(groups.items(), start=1):
+            # one write covers every layer: [L, hidden] into slot gid
+            self.table_t[:, gid, :] = self._stacked_vectors_for(bh, nz)
+            idx[rows] = gid
+        if len(idx):
+            self.row_group[:len(idx)].copy_(
+                pinned_to_device(idx.tolist(), torch.int64, self.device))
         self._last_refl_key = refl_key
-        _assert_replicated_across_tp(self.vectors[0], "reflection_vectors[0]")
+        _assert_replicated_across_tp(self.table[0], "reflection_table[0]")
         # (reflection vectors depend on block_hash [+ nonce when per-nonce seeded],
         # never the step; routing also depends on step so it is refreshed
         # separately, per step, via set_routing.)
@@ -670,26 +686,18 @@ def _ablated(part: str) -> bool:
 
 def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: int,
                       hidden_size: int, device, dtype,
-                      hf_config=None) -> PoCNativeState:
+                      hf_config=None, max_groups: int | None = None) -> PoCNativeState:
     """Wrap each decoder layer (Householder) AND the token embedding (PoC-embed
     injection) BEFORE compilation, sharing one mask. Returns the state to drive
     them. Idempotent: skipped if already wrapped."""
     if getattr(model, "_poc_native_state", None) is not None:
         return model._poc_native_state
-    state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype)
+    state = PoCNativeState(len(layers), hidden_size, max_tokens, device, dtype,
+                           max_groups=max_groups)
     from gonka_poc.poc.decode_random import set_ladder_base_for_model
     _mt = getattr(hf_config, "model_type", None)
     logger.info("PoC seeded-routing ladder base: %d (model_type=%s)",
                 set_ladder_base_for_model(_mt), _mt)
-    # The fused reflect JIT-compiles on first call; do it here, before CUDA-graph
-    # capture, so the JIT does not land inside the capture.
-    try:
-        _fused = _reflect_kernel.warmup(hidden_size, device, dtype)
-    except Exception as e:  # noqa: BLE001 — fall back to reference, not a crash
-        logger.warning("PoC fused reflect: warmup failed (%r), reference path", e)
-        os.environ["POC_FUSED_REFLECT"] = "0"
-        _fused = False
-    logger.info("PoC reflect: %s", "fused Triton" if _fused else "4-kernel reference")
     vocab = int(getattr(hf_config, "vocab_size", 0) or 0)
     if vocab and not _ablated("pseudo"):
         state.token_id_vocab = vocab
@@ -703,7 +711,7 @@ def attach_native_poc(model: nn.Module, layers: list, embed_owner, max_tokens: i
     if not _ablated("reflect"):
         for i, layer in enumerate(layers):
             _install_poc_patch(
-                layer, PoCLayerWrapper(layer, state.vectors[i], state.mask))
+                layer, PoCLayerWrapper(layer, state.table[i], state.row_group, state.mask))
     if embed_owner is not None and hasattr(embed_owner, "embed_tokens"):
         # Patch forward IN PLACE, never replace the module: wrapping renames
         # parameters (embed_tokens.weight -> embed_tokens.inner.weight) and
