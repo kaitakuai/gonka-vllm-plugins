@@ -438,24 +438,13 @@ def execute_poc_forward(
         slot_mapping=slot_mapping_dict,
         skip_compiled=True,
     ):
-        try:
-            with poc_forward_context():
-                hidden_states = model(
-                    input_ids=poc_input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-                )
-        finally:
-            # The layer hooks exist for this forward only. Left registered, they
-            # change how torch.compile traces the layers for every LATER forward:
-            # on MiniMax-M2.7 (VLLM_COMPILE) one prefill-scheme round shifted the
-            # decode-PoC chains computed afterwards (0/32 -> 14/32 mismatches at
-            # tau 0.025 on the same references). Re-attaching per call is cheap.
-            hooks = getattr(worker, "_poc_layer_hooks", None)
-            if hooks is not None:
-                hooks.detach()
-                worker._poc_layer_hooks = None
+        with poc_forward_context():
+            hidden_states = model(
+                input_ids=poc_input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+            )
 
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
