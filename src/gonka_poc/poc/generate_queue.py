@@ -64,78 +64,10 @@ def _server_gpu() -> str:
 
 
 
-POC_ROLLING_WINDOW_DEFAULT = 256
 # vLLM schedules lower values first under --scheduling-policy priority (chat
 # requests carry 0): PoC rows go ahead of chat, and chat is what gets preempted
 # when KV runs short. Under the default FCFS policy the value is ignored.
 POC_REQUEST_PRIORITY = -1
-
-
-def _rolling_window(total_nonces: int) -> int:
-    """How many nonces of a round are in flight at once (client-side concurrency).
-
-    This is the node's only PoC scheduling knob: the engine schedules PoC rows
-    like chat (ADR-0017), so the window is what keeps a round from occupying the
-    whole batch. POC_ROLLING_WINDOW: >0 — explicit; empty/"auto" — 256 (measured
-    05.09 on B300: with live chat at c=256 it beats the old in-engine share on
-    both sides; alone, 512 saturates the GPU); 0 — off, every nonce at once.
-    """
-    raw = os.environ.get("POC_ROLLING_WINDOW", "").strip().lower()
-    if raw == "0":
-        return 0
-    if not raw or raw == "auto":
-        return min(POC_ROLLING_WINDOW_DEFAULT, max(1, total_nonces))
-    try:
-        w = int(raw)
-    except ValueError:
-        logger.warning("POC_ROLLING_WINDOW=%r: not a number or auto, disabling", raw)
-        return 0
-    return max(0, min(w, total_nonces))
-
-
-def _rolling_refill(window: int) -> int:
-    """Refill size: POC_ROLLING_REFILL or a quarter of the window (at least 16).
-    Smaller refills smooth the flow but add prefill steps that stall decode;
-    larger ones approach all-at-once admission."""
-    raw = os.environ.get("POC_ROLLING_REFILL", "").strip()
-    if raw.isdigit() and int(raw) > 0:
-        return min(int(raw), window)
-    return max(1, min(window, window // 4))
-
-
-async def _run_rolling(compute_one, nonces, window: int, refill: int):
-    """The first `window` nonces start together; afterwards, once `refill` slots
-    have freed (or nothing is in flight), the next `refill` nonces are launched.
-    Returns results in the order of the input list."""
-    results = [None] * len(nonces)
-    pending = list(range(len(nonces)))
-    running = {}                      # task -> index
-    freed = 0
-
-    def launch(k: int):
-        nonlocal pending
-        batch, pending = pending[:k], pending[k:]
-        for idx in batch:
-            running[asyncio.ensure_future(compute_one(nonces[idx]))] = idx
-        if batch:
-            logger.info("PoC rolling admission: refill of %d (in flight %d, left %d)",
-                        len(batch), len(running), len(pending))
-
-    launch(window)
-    while running:
-        done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
-            idx = running.pop(t)
-            try:
-                results[idx] = t.result()
-            except Exception as e:   # compute_one catches its own; safety net
-                logger.error("PoC rolling: nonce %s raised %r", nonces[idx], e)
-                results[idx] = None
-            freed += 1
-        if pending and (freed >= refill or not running):
-            launch(min(freed, len(pending)))
-            freed = 0
-    return results
 
 
 async def compute_nonce_artifacts(
@@ -265,17 +197,10 @@ async def compute_nonce_artifacts(
             _inflight.discard(request_id)
         return None
 
-    # Client-side concurrency: the window caps in-flight nonces, the refill is
-    # how many are launched at once as slots free up. POC_ROLLING_WINDOW=0 = all
-    # at once (the engine then queues them like a burst of chat requests).
-    window = _rolling_window(len(nonces))
-    if window and len(nonces) > window:
-        refill = _rolling_refill(window)
-        logger.info("PoC rolling admission: %d nonces, window %d, refill %d",
-                    len(nonces), window, refill)
-        results = await _run_rolling(compute_one, list(nonces), window, refill)
-    else:
-        results = await asyncio.gather(*[compute_one(n) for n in nonces])
+    # Every nonce goes to the engine at once; the scheduler admits them by
+    # max_num_seqs and KV like a burst of chat requests (measured 10.09 on B300:
+    # identical to a client-side window sized to the cudagraph capture).
+    results = await asyncio.gather(*[compute_one(n) for n in nonces])
     out = [r for r in results if r is not None]
     # Batch-level summary. Per-nonce warnings would flood the log in a 500-nonce round;
     # this line states the shortfall once, in the terms an operator acts on.
@@ -497,9 +422,8 @@ class GenerateQueue:
         """Process a single generate job."""
         total_nonces = len(job.nonces)
         # batch_size 0 = no client-side chunking: submit every nonce at once and let the
-        # ENGINE schedule them like chat; the rolling window above caps in-flight
-        # nonces. Chunking here awaits each chunk SEQUENTIALLY, pinning in-flight
-        # nonces to the chunk size no matter what the engine can serve.
+        # ENGINE schedule them like chat. Chunking here awaits each chunk SEQUENTIALLY,
+        # pinning in-flight nonces to the chunk size no matter what the engine can serve.
         step = job.batch_size or total_nonces
         n_chunks = (total_nonces + step - 1) // step
         logger.info(f"PoC queue job {job.request_id[:8]}: {total_nonces} nonces, batch_size={job.batch_size}, chunks={n_chunks}")
