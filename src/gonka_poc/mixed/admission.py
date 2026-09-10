@@ -2,9 +2,9 @@
 """The one thing the scheduler needs to know about a PoC row.
 
 PoC nonces are ordinary engine requests: vLLM's scheduler admits them, budgets
-them, allocates their KV and preempts them exactly as it does chat, and the
-node keeps their concurrency in check on the client side (``POC_ROLLING_WINDOW``
-in ``generate_queue``). No per-step PoC policy lives in the engine any more —
+them, allocates their KV and preempts them exactly as it does chat; their
+concurrency is the engine's ``max_num_seqs``. No per-step PoC policy lives in
+the engine any more —
 the row cap, the token share, the KV headroom gate, the stall hand-off, the
 decode-only isolation and the one-step hold of a nonce's first decode row were
 all removed on 2026-09-05 after they measured as the cause of the behaviour they

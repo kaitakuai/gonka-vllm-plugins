@@ -42,7 +42,9 @@ unchanged (DeepSeek goldens at τ=0.05 and 42 MiniMax cells within noise), PoC a
 Removed: `PoCAdmission` and four of the five scheduler hooks (one `poc_step_tokens` call
 remains: atomic PoC prefill, one token per decode step), decode-only steps, the KV
 headroom gate, `poc_share`, the fused Triton reflection, the admission diagnostics, and the
-experiment knobs. `POC_ROLLING_WINDOW` (default 256) is the node's PoC scheduling knob.
+experiment knobs. `POC_ROLLING_WINDOW`/`POC_ROLLING_REFILL` followed on 2026-09-10: a
+client-side window sized to the cudagraph capture measured identical to none at all, so
+the node's PoC concurrency is `--max-num-seqs`, set with the KV pool and the capture size.
 See [ADR-0017](adr/ADR-0017-poc-scheduled-like-chat.md).
 
 ## 2026-09-04 — Consensus constants in traced code change only through source
