@@ -3,6 +3,16 @@
 Short, factual, link-rich. One entry per decision that outlives the PR that
 made it. Full rationale lives in `docs/adr/`.
 
+## 2026-09-10 — Dead PoC knobs removed
+
+`poc_max_batch_size`, `poc_seq_len` and `poc_max_tokens` (`--additional-config`) and the
+`POC_CHAT_BUSY_BACKOFF_SEC` constant are gone. The chain sends `seq_len`, `max_tokens`, `k_dim`
+and the scheme with every request; the batch is bounded by `--max-num-seqs` and the cudagraph
+capture size, which the node profile sets to one number N per card; the decode-state pool is
+sized by `max_num_seqs`. The only `additional-config` knob left is `poc_vector_artifacts`.
+The "engine busy" retry of continuous mining keeps a fixed 0.1 s pause. See
+[ADR-0017](adr/ADR-0017-poc-scheduled-like-chat.md).
+
 ## 2026-09-07 — One ladder base (100) for every model; MiniMax reference corpora to be re-taken
 
 The seeded-routing ladder base was a per-model constant (100 on DeepSeek-V4, 0 elsewhere)

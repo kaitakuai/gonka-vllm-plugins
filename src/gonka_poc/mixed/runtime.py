@@ -188,7 +188,7 @@ class PoCMixedDecodeManager:
     trajectory). KV itself is paged via the scheduler — the state holds no blocks.
     """
 
-    def __init__(self, poc_max_batch_size: int = 0):
+    def __init__(self):
         self._state: dict[str, PoCDecodeState] = {}
         self._next_slot = 0
 
@@ -246,7 +246,7 @@ def setup_decode_poc(runner, poc_requests) -> bool:
             continue
         st = mgr.allocate(r.req_id, pp.nonce, pp.seq_len, pp.max_tokens)
         if st is None:
-            # Pool exhausted (scheduler caps to poc_max_batch_size; defensive).
+            # Pool exhausted (the scheduler caps rows at max_num_seqs; defensive).
             logger.warning("PoC mixed-decode slot pool exhausted for %s",
                            r.req_id)
             continue
@@ -288,8 +288,8 @@ def _cat_prev_k(states, where: str) -> "torch.Tensor":
         raise RuntimeError(
             f"PoC {where}: {len(missing)} of {len(states)} decode rows have no "
             f"prev_k (prefill output not processed yet), rows {missing[:8]}. "
-            "Known race, see this function's docstring; observed only at "
-            "poc_max_batch_size=1.")
+            "Known race, see this function's docstring; observed at a "
+            "decode-state pool of one slot and under memory pressure.")
     return torch.cat([st.prev_k_t for st in states])
 
 

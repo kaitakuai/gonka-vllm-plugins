@@ -11,7 +11,6 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
 import logging
-from gonka_poc.mixed.policy import poc_cfg
 from gonka_poc.poc.config import PoCState
 from gonka_poc.poc.data import (
     Artifact, DEFAULT_DIST_THRESHOLD, DEFAULT_MARGIN_TAU, DEFAULT_P_MISMATCH,
@@ -62,8 +61,9 @@ def _server_gpu() -> str:
 
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
-POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
+# Pause before re-submitting a mining round whose compute timed out (engine busy).
+_ENGINE_BUSY_RETRY_SEC = 0.1
 # Request default when the chain sends no batch_size: 32, as in 3.0.16.
 POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
@@ -75,15 +75,15 @@ def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
 
     The chain's batch_size, verbatim, as in 3.0.16 (the request default is
     POC_BATCH_SIZE_DEFAULT = 32). The decode scheme alone treats 0 as AUTO —
-    poc_max_batch_size from ``--additional-config``, then max_num_seqs — since its
-    rows are ordinary scheduler requests capped by max_num_seqs. A prefill-scheme
-    round is one forward; whether batch_size x seq_len fits the node is the
-    operator's configuration, the node does not resize it."""
+    the engine's max_num_seqs — since its rows are ordinary scheduler requests
+    capped by max_num_seqs. A prefill-scheme round is one forward; whether
+    batch_size x seq_len fits the node is the operator's configuration, the node
+    does not resize it."""
     if configured or prefill:
         return configured
     vc = getattr(engine_client, "vllm_config", None)
     sc = getattr(vc, "scheduler_config", None)
-    resolved = int(poc_cfg(vc, "poc_max_batch_size") or 0) or getattr(sc, "max_num_seqs", 0)
+    resolved = int(getattr(sc, "max_num_seqs", 0) or 0)
     if resolved:
         return resolved
     logger.warning("PoC mining: engine config unreadable, defaulting round to 32")
@@ -368,7 +368,7 @@ async def _generation_loop(
         n_groups=config["n_groups"],
     )
     # Continuous mining pulls a round of nonces per iteration. 0 = AUTO -> ask the ENGINE
-    # how many PoC sequences it can hold (poc_max_batch_size, auto-scaled to max_num_seqs)
+    # how many PoC sequences it can hold (max_num_seqs)
     # instead of a client-side constant, so a bigger machine mines a bigger round.
     poc_decode = config.get("scheme", "prefill") == "decode"
     batch_size = resolve_mining_round(config["batch_size"], engine_client,
@@ -409,7 +409,7 @@ async def _generation_loop(
                 if timeout_count == 1 or timeout_count % 10 == 0:
                     logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
                 pending_nonces = nonces
-                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
+                await asyncio.sleep(_ENGINE_BUSY_RETRY_SEC)
                 continue
 
             timeout_count = 0

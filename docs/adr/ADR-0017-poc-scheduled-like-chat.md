@@ -31,7 +31,7 @@ go (`asyncio.gather` over every nonce) and the layer then metered it.
    removed on 2026-09-10: sized to the cudagraph capture they measured identical to none).
 3. **No first-decode hold.** The prefill snap that publishes `prev_k` runs in the worker's
    `execute_model` before the next step's inputs are built (both GPU runners); the race of
-   e2bb23a was a state-slot shortage at `poc_max_batch_size=1`. The decode-state pool is
+   e2bb23a was a state-slot shortage in a pool of one slot. The decode-state pool is
    sized by `max_num_seqs`, which vLLM never exceeds. `_cat_prev_k` still fails loudly.
 4. **No fused reflection kernel.** The Householder reflection is consensus math; the
    reference torch expression is the only path. The Triton variant gave +12% PoC on Hopper,
@@ -40,8 +40,8 @@ go (`asyncio.gather` over every nonce) and the layer then metered it.
 5. **Removed with the layer:** decode-only steps (`POC_MIXED_BATCH=0`), `POC_KV_HEADROOM`,
    `POC_PREFILL_PER_STEP`, `poc_share`, the cudagraph cap, the stall hand-off, the
    admission diagnostics, and the experiment knobs `POC_ENGINE_ADMISSION` /
-   `POC_PREFILL_LANDING_HOLD`. `poc_max_batch_size` now only sizes the decode-state pool
-   (0 = `max_num_seqs`).
+   `POC_PREFILL_LANDING_HOLD`. The decode-state pool is sized by `max_num_seqs`;
+   `poc_max_batch_size`, `poc_seq_len` and `poc_max_tokens` were removed on 2026-09-10.
 
 ## Evidence (1×B300, 05.09; τ = 0 / 0.02 / 0.05 / 0.1)
 
@@ -77,10 +77,11 @@ behaviour change:
 - `SchedulerOutput.poc_req_ids` — the bridge keeps its own registry of PoC rows
   (registered from `NewRequestData.poc_params`, dropped on `finished_req_ids`) and
   intersects it with what the scheduler scheduled this step.
-- The four PoC knobs on `CacheConfig` (`poc_max_batch_size`, `poc_seq_len`,
-  `poc_max_tokens`, `poc_vector_artifacts`) — plain defaults with no CLI. They are now
-  read from vLLM's public `--additional-config '{"gonka_poc": {...}}'` with the same
-  defaults (`gonka_poc.mixed.policy.poc_cfg`).
+- The PoC knobs on `CacheConfig` are gone. The one remaining knob,
+  `poc_vector_artifacts`, is read from vLLM's public
+  `--additional-config '{"gonka_poc": {...}}'` (`gonka_poc.mixed.policy.poc_cfg`);
+  `seq_len`, `max_tokens`, `k_dim` and the scheme arrive with every request, and the
+  batch is bounded by `--max-num-seqs` and the cudagraph capture size.
 
 Verified on 1×B300 (05.09, fresh compile cache) against the post-removal column above:
 golden NVFP4 8.59 / 0.139 / 0.0058 / 0, golden REAP 41.85 / 16.47 / 3.35 / 0.15, PoC 3000

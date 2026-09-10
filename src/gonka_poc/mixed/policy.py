@@ -16,14 +16,11 @@ def poc_is_pure_path(poc_params) -> bool:
 # PoC knobs ride in vLLM's public ``--additional-config`` under the "gonka_poc"
 # key (``VllmConfig.additional_config``); the engine declares nothing for us.
 # Every read goes through poc_cfg() and falls back to the SAME default on any
-# tree, so consensus-relevant behaviour (seq_len, max_tokens) cannot drift
-# between deployments that pass the knob and ones that do not.
+# tree. The consensus inputs (seq_len, max_tokens, k_dim, scheme) are not knobs:
+# they arrive in every request from the chain. The batch is bounded by the
+# engine's own ``--max-num-seqs`` and cudagraph capture size.
 POC_CONFIG_DEFAULTS = {
-    # decode-state slots: 0 = max_num_seqs (vLLM never runs more rows than that)
-    "poc_max_batch_size": 0,
-    "poc_seq_len": 256,
-    "poc_max_tokens": 256,
-    "poc_vector_artifacts": False,
+    "poc_vector_artifacts": False,   # emit per-step vectors alongside the k trajectory
 }
 
 
@@ -32,8 +29,8 @@ def poc_cfg(vllm_config, name: str):
 
     Accepts ``None`` / any object without ``additional_config`` (tests, partial
     runners) and returns the default. Values are coerced to the default's type
-    so ``--additional-config '{"gonka_poc": {"poc_max_batch_size": "512"}}'``
-    behaves like the integer form.
+    so ``--additional-config '{"gonka_poc": {"poc_vector_artifacts": "1"}}'``
+    behaves like the boolean form.
     """
     if name not in POC_CONFIG_DEFAULTS:
         raise KeyError(f"unknown PoC config knob: {name}")
