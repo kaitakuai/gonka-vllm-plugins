@@ -76,7 +76,7 @@ def resolve_mining_round(configured: int, engine_client, seq_len: int = 0,
     The chain's batch_size, verbatim, as in 3.0.16 (the request default is
     POC_BATCH_SIZE_DEFAULT = 32). The decode scheme alone treats 0 as AUTO —
     poc_max_batch_size from ``--additional-config``, then max_num_seqs — since its
-    rows are ordinary scheduler requests under the rolling window. A prefill-scheme
+    rows are ordinary scheduler requests capped by max_num_seqs. A prefill-scheme
     round is one forward; whether batch_size x seq_len fits the node is the
     operator's configuration, the node does not resize it."""
     if configured or prefill:

@@ -26,8 +26,9 @@ go (`asyncio.gather` over every nonce) and the layer then metered it.
    last prompt token, so a chunked PoC prefill is not defined); a decoding PoC row takes one
    token per step (it produces no sampled tokens, so vLLM's own arithmetic would give 0).
    `poc_req_ids` (the row mask) and the emit-once finish stay.
-2. **Concurrency lives on the client.** `POC_ROLLING_WINDOW` (default 256, refill window÷4)
-   is the node's only PoC scheduling knob; `0` submits every nonce at once.
+2. **Concurrency lives in the engine.** Every nonce of a job is submitted at once and
+   `--max-num-seqs` caps what runs (the client-side window and refill of the first cut were
+   removed on 2026-09-10: sized to the cudagraph capture they measured identical to none).
 3. **No first-decode hold.** The prefill snap that publishes `prev_k` runs in the worker's
    `execute_model` before the next step's inputs are built (both GPU runners); the race of
    e2bb23a was a state-slot shortage at `poc_max_batch_size=1`. The decode-state pool is
