@@ -47,6 +47,32 @@ def _poc_diag() -> bool:
     return os.environ.get("POC_DIAG", "") == "1"
 
 
+def _decoder_owner(model):
+    """The module holding the decoder layer list, and the list itself.
+
+    Wrappers differ. A text-only model keeps the language stack in
+    ``model.model``; a multimodal one keeps it deeper --
+    ``Glm5NextForConditionalGeneration`` holds ``language_model`` (itself a
+    ``Glm5NextForCausalLM``) whose ``.model`` owns the layers, ``embed_tokens``
+    and ``norm``. All three are patched together, so the owner of the layers is
+    also what goes on as ``embed_owner``.
+    """
+    tried = []
+    for path in (("model",), ("language_model", "model"), ("language_model",), ()):
+        owner = model
+        for attr in path:
+            owner = getattr(owner, attr, None)
+            if owner is None:
+                break
+        if owner is None:
+            continue
+        tried.append("model." + ".".join(path) if path else "model")
+        layers = getattr(owner, "layers", None)
+        if layers is not None:
+            return owner, layers, tried
+    return None, None, tried
+
+
 class PoCRunnerBridge:
     def __init__(self, runner) -> None:
         self.runner = runner
@@ -70,12 +96,11 @@ class PoCRunnerBridge:
         from gonka_poc.mixed.native import attach_native_poc
 
         runner = self.runner
-        inner = getattr(model, "model", model)
-        layers = getattr(inner, "layers", None)
+        inner, layers, tried = _decoder_owner(model)
         if layers is None:
             raise RuntimeError(
                 f"PoC: cannot attach native transforms, {type(model).__name__} "
-                "exposes no decoder layer list")
+                f"exposes no decoder layer list (tried: {', '.join(tried)})")
         self.native = attach_native_poc(
             model, layers, inner, runner.max_num_tokens,
             runner.model_config.get_hidden_size(), runner.device, runner.dtype,
