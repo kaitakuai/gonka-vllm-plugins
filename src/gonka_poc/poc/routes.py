@@ -448,6 +448,26 @@ async def _generation_loop(
 # API Endpoints
 # =============================================================================
 
+
+def _check_prefill_round_fits(engine_client: Any, batch_size: int, seq_len: int) -> None:
+    """Refuse a prefill-scheme chunk that cannot run as one forward.
+
+    The prefill scheme runs ``batch_size`` nonces as ONE forward of
+    ``batch_size * seq_len`` tokens, and the per-token PoC buffers (row mask,
+    reflection groups, embeds) are sized to the engine's
+    ``max_num_batched_tokens``. A bigger chunk fails inside the forward with a
+    shape error and takes the engine down; vLLM 0.28 resolves the flag to 2048
+    when a node config leaves it out (0.25.1 resolved 32768).
+    """
+    sc = getattr(getattr(engine_client, "vllm_config", None), "scheduler_config", None)
+    limit = int(getattr(sc, "max_num_batched_tokens", 0) or 0)
+    if limit and batch_size * seq_len > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"prefill PoC chunk of {batch_size} nonces x {seq_len} tokens = "
+                    f"{batch_size * seq_len} tokens exceeds max_num_batched_tokens={limit}; "
+                    "lower POC_BATCH_SIZE_DEFAULT/batch_size or raise --max-num-batched-tokens"))
+
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}, {body.poc_stronger_rng}")
@@ -461,6 +481,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     
     await _cancel_poc_tasks(app_id)
     
+    if body.params.scheme != "decode":
+        _check_prefill_round_fits(engine_client, body.batch_size, body.params.seq_len)
     config = {
         "block_hash": body.block_hash,
         "block_height": body.block_height,
@@ -647,6 +669,8 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     
     total_nonces = len(body.nonces)
     step = body.batch_size or total_nonces or 1   # 0 = submit all; engine batches
+    if body.params.scheme != "decode":
+        _check_prefill_round_fits(engine_client, step, body.params.seq_len)
     n_chunks = (total_nonces + step - 1) // step
     logger.info(f"PoC /generate: {total_nonces} nonces, batch_size={body.batch_size}, chunks={n_chunks}")
 
