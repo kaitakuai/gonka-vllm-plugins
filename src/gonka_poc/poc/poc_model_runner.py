@@ -293,6 +293,13 @@ def execute_poc_forward(
     model = worker.model_runner.model
     vllm_config = worker.vllm_config
     batch_size = len(nonces)
+    max_tokens = int(getattr(worker.model_runner, "max_num_tokens", 0) or 0)
+    if max_tokens and batch_size * seq_len > max_tokens:
+        # The native PoC buffers are [max_num_tokens]; a larger forward fails
+        # mid-model with a shape error. Fail loudly and early instead.
+        raise ValueError(
+            f"PoC forward of {batch_size} x {seq_len} = {batch_size * seq_len} tokens "
+            f"exceeds the runner's max_num_tokens={max_tokens} (--max-num-batched-tokens)")
 
     tp_group = get_tp_group()
     is_tp_driver = tp_group.rank_in_group == 0
