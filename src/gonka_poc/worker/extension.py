@@ -118,22 +118,28 @@ class PoCWorkerExtension:
         # hard-fails in gonka_poc._compat, so no fallback is needed.
         hidden_size = int(self.vllm_config.model_config.get_hidden_size())
 
-        result = _execute_poc_forward(
-            self,  # the live Worker; matches the ``worker`` param in poc_model_runner
-            block_hash,
-            public_key,
-            list(nonces),
-            int(seq_len),
-            int(hidden_size),
-            k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
-            poc_stronger_rng=bool(poc_stronger_rng),
-            borrowed_block_ids=(
-                list(borrowed_block_ids)
-                if borrowed_block_ids is not None else None),
-            borrowed_stripe=(
-                int(borrowed_stripe)
-                if borrowed_stripe is not None else None),
-        )
+        # Prefill scheme only: the in-model PoC mask is never set on this path,
+        # so the decode-PoC wrappers would compute and discard their transform
+        # over every row. Skip them for this forward (values unchanged).
+        from gonka_poc.mixed.native import prefill_wrappers_bypassed
+
+        with prefill_wrappers_bypassed():
+            result = _execute_poc_forward(
+                self,  # the live Worker; matches the ``worker`` param in poc_model_runner
+                block_hash,
+                public_key,
+                list(nonces),
+                int(seq_len),
+                int(hidden_size),
+                k_dim=int(k_dim) if k_dim is not None else DEFAULT_K_DIM,
+                poc_stronger_rng=bool(poc_stronger_rng),
+                borrowed_block_ids=(
+                    list(borrowed_block_ids)
+                    if borrowed_block_ids is not None else None),
+                borrowed_stripe=(
+                    int(borrowed_stripe)
+                    if borrowed_stripe is not None else None),
+            )
 
         rank = int(getattr(self, "rank", -1))
 
