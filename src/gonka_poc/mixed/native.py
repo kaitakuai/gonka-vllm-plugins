@@ -12,6 +12,7 @@ shared boolean mask buffer. Chat rows pass through unchanged (mask False →
 vectors (one per layer, seeded by block_hash) and the mask live in stable buffers
 updated in-place each round/step, so replay reads the live values.
 """
+import contextlib
 import os
 
 import torch
@@ -91,6 +92,40 @@ def _reflect(x: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tens
     return _reflect_torch(x, v, mask)
 
 
+# Prefill-scheme bypass. The prefill scheme runs one eager forward over
+# collective_rpc (``PoCWorkerExtension.execute_poc_forward``) and never sets the
+# PoC mask, so every wrapper below would compute its transform over all rows and
+# then return its input unchanged. While this switch is on, the class-level
+# dispatcher calls the original forward instead: same values, none of the cost.
+# The switch is never honoured while a CUDA graph is being captured, so a graph
+# recorded during a prefill forward still carries the wrappers that decode rows
+# need at replay. Scheduler steps (chat and decode rows) never turn it on.
+_PREFILL_BYPASS = [False]
+_PREFILL_BYPASS_LOGGED = [False]
+
+
+@contextlib.contextmanager
+def prefill_wrappers_bypassed():
+    """Skip the decode-PoC wrappers for the duration of a prefill-scheme forward."""
+    prev = _PREFILL_BYPASS[0]
+    _PREFILL_BYPASS[0] = True
+    if not _PREFILL_BYPASS_LOGGED[0]:
+        _PREFILL_BYPASS_LOGGED[0] = True
+        logger.info("PoC prefill forward: decode-PoC wrappers bypassed "
+                    "(mask is empty on this path; values unchanged)")
+    try:
+        yield
+    finally:
+        _PREFILL_BYPASS[0] = prev
+
+
+def _wrappers_bypassed() -> bool:
+    if not _PREFILL_BYPASS[0]:
+        return False
+    return not (torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing())
+
+
 def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
     """Class-level forward patch. torch.compile traces the CLASS forward, so
     instance ``obj.forward = ...`` assignments are ignored inside compiled
@@ -107,7 +142,7 @@ def _install_poc_patch(module: nn.Module, wrapper: nn.Module) -> None:
 
         def _poc_forward(self, *args, **kwargs):
             w = getattr(self, "_poc_wrap", None)
-            if w is not None:
+            if w is not None and not _wrappers_bypassed():
                 return w.forward(*args, **kwargs)
             return cls._poc_orig_forward(self, *args, **kwargs)
 
